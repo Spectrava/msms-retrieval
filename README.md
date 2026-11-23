@@ -150,6 +150,30 @@ carries a collapse penalty (mean pairwise cosine of the latents): without it the
 ROI to one vector. The output Parquet has one row per ROI with degree, component and graph latent
 (null for ROIs without MS2), plus `.edges.parquet` and `.provenance.json`.
 
+## Generating molecules from the embeddings
+
+`sna/generate.py` and `scripts/generate_molecules.py` train the smallest honest decoder on top of the
+frozen DreaMS embedding: a character-level LSTM that takes the embedding as its first token and
+predicts SMILES characters, trained on the MassSpecGym train fold and scored on the val fold.
+
+```bash
+python scripts/generate_molecules.py --tsv data/MassSpecGym1.5.tsv \
+    --ckpt checkpoints/DreaMS_embedding_model_MassSpecGym.ckpt \
+    --out data/msg_generated.parquet --spectra-embeddings data/7600_ms2_embeddings.parquet
+```
+
+On the 19,429 val spectra (val molecules are disjoint from train, so an exact match is impossible by
+construction): 73.0% of generated SMILES parse, mean Tanimoto to the true molecule 0.155. The
+nearest-neighbour retrieval baseline on the same embeddings scores 0.187, and feeding the decoder the
+embedding of a *different* spectrum gives 0.064 - the embedding does steer the decoder, but not
+enough to beat plain retrieval. On training spectra the decoder reproduces its own molecule 26.9% of
+the time, so part of what it "knows" is memorisation. For the 2,736 MS2 spectra of the 7600 export it
+proposes 1,804 parseable structures, and only 31 of them have a monoisotopic mass consistent with the
+observed precursor (±0.05, as [M+H]+ or [M+Na]+).
+
+The DreaMS embedding is discriminative: it is a good retrieval key and a weak generative one.
+Generated SMILES are hypotheses to be reviewed, never identifications.
+
 ## License
 
 [MIT](LICENSE). Upstream acknowledgments and license notices are in

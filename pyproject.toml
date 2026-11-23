@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
 # The encoder and the MS2 scripts need only these; the MassSpecGym training harness needs the extras.
-dependencies = ["torch>=2.4", "numpy>=1.26", "pandas>=2.0", "datasketch>=1.6"]
+dependencies = ["torch>=2.4", "numpy>=1.26", "pandas>=2.0", "datasketch>=1.6", "rdkit>=2024.3.1"]
 
 [project.optional-dependencies]
 train = ["rdkit>=2024.3.1", "transformers>=4.40", "pytest>=8.0"]

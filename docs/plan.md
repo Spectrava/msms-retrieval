@@ -84,6 +84,12 @@ and stays out of `sna`:
 - never present a predicted structure as an identification without the annotation workflow that
   a reviewer confirms.
 
+A first probe (Stage 5, done): a character LSTM conditioned on the frozen DreaMS embedding, trained
+on MassSpecGym train and scored on val, reaches mean Tanimoto 0.155 to the true molecule - below the
+0.187 of nearest-neighbour retrieval on the same embeddings, and well above 0.064 from a random
+embedding. Structure inference from these embeddings is therefore not ready: retrieval plus the
+library's own structures is the honest path, and any generated SMILES must be labelled a hypothesis.
+
 ## Gate before any of this reaches the UI
 
 Nothing from this repo enters the Spectrava frontend until it comes through `validateBundle` with
