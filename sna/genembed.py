@@ -11,9 +11,21 @@ on the raw 1024-d DreaMS embedding (sna.generate.SmilesGenerator).
 """
 from __future__ import annotations
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+from sna.lsh import binned
+
+
+def peak_matrix(mz, intensity, offsets, bins: int = 1000) -> np.ndarray:
+    """Each spectrum as `bins` one-unit m/z bins summing to 1 - the raw input a from-scratch encoder sees."""
+    out = np.zeros((len(offsets) - 1, bins), np.float32)
+    for i in range(len(offsets) - 1):
+        v = binned(mz[offsets[i]:offsets[i + 1]], intensity[offsets[i]:offsets[i + 1]], bins)
+        out[i] = v / v.sum() if v.sum() else 0.0
+    return out
 
 
 def char_tensor(smiles: list[str], vocab: list[str], max_len: int) -> torch.Tensor:
@@ -56,6 +68,7 @@ class GenerativeEmbedding(nn.Module):
         self.vocab = vocab
         self.end = len(vocab)
         self.encoder = nn.Sequential(nn.Linear(dim_in, latent), nn.LayerNorm(latent), nn.GELU())
+        self.reconstruct = nn.Linear(latent, dim_in)  # only used when the input is the raw spectrum
         self.seed = nn.Linear(latent, hidden)
         self.embed = nn.Embedding(self.end + 1, hidden)
         self.blocks = nn.ModuleList([Block(hidden, heads) for _ in range(layers)])
@@ -69,11 +82,14 @@ class GenerativeEmbedding(nn.Module):
             x = block(x)
         return self.out(x)
 
-    def loss(self, z: torch.Tensor, chars: torch.Tensor) -> torch.Tensor:
+    def loss(self, z: torch.Tensor, chars: torch.Tensor, spectrum: torch.Tensor | None = None) -> torch.Tensor:
         """Teacher forcing: the logits at position i predict character i+1 (END after the last)."""
         x = torch.cat([self.seed(self.latent(z))[:, None, :], self.embed(chars)], dim=1)
         target = torch.cat([chars, torch.full((len(chars), 1), self.end, device=chars.device)], dim=1)
-        return F.cross_entropy(self._logits(x).reshape(-1, self.end + 1), target.reshape(-1))
+        loss = F.cross_entropy(self._logits(x).reshape(-1, self.end + 1), target.reshape(-1))
+        if spectrum is not None:
+            loss = loss + F.mse_loss(self.reconstruct(self.latent(z)), spectrum)
+        return loss
 
     @torch.inference_mode()
     def generate(self, z: torch.Tensor, max_len: int = 160, temperature: float = 0.0) -> list[str]:
@@ -99,7 +115,7 @@ class GenerativeEmbedding(nn.Module):
 
 def train_generative(z: torch.Tensor, smiles: list[str], vocab: list[str], latent: int = 128,
                      epochs: int = 10, batch: int = 256, hidden: int = 256, layers: int = 4,
-                     max_len: int = 160) -> GenerativeEmbedding:
+                     max_len: int = 160, spectra: torch.Tensor | None = None) -> GenerativeEmbedding:
     model = GenerativeEmbedding(z.shape[1], vocab, latent, hidden, layers).cuda()
     chars = char_tensor(smiles, vocab, max_len)
     opt = torch.optim.Adam(model.parameters(), 1e-3)
@@ -108,7 +124,7 @@ def train_generative(z: torch.Tensor, smiles: list[str], vocab: list[str], laten
         loss = 0.0
         for i in range(0, len(order), batch):
             r = order[i:i + batch]
-            obj = model.loss(z[r], chars[r])
+            obj = model.loss(z[r], chars[r], spectra[r] if spectra is not None else None)
             opt.zero_grad(); obj.backward(); opt.step()
             loss += obj.item() * len(r)
         print(f"[generative] epoch {epoch} next-character loss {loss / len(z):.3f}", flush=True)

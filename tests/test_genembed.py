@@ -6,6 +6,21 @@ from sna.align import canonical
 from sna.genembed import train_generative
 
 
+def test_latent_rebuilds_the_spectrum_it_was_given():
+    """With the raw spectrum as input, the latent is checked against the observation, not just a label."""
+    unique = ["CCO", "CCOC", "CC(=O)O", "c1ccccc1", "CCNCC", "OCCO", "CCCl", "C(C)C"]
+    vocab = sorted({c for s in unique for c in s})
+    base = np.random.default_rng(1).normal(size=(len(unique), 40)).astype(np.float32)
+    z = torch.tensor(np.repeat(base, 8, axis=0), device="cuda")
+    model = train_generative(z, [s for s in unique for _ in range(8)], vocab,
+                             latent=32, epochs=60, batch=32, hidden=64, layers=2, spectra=z)
+    b = torch.tensor(base, device="cuda")
+    with torch.no_grad():
+        rec = model.reconstruct(model.latent(b))
+        cos = ((rec * b).sum(1) / (rec.norm(dim=1) * b.norm(dim=1) + 1e-9)).mean()
+    assert cos > 0.9, f"reconstructed spectrum cosine {cos:.3f}"
+
+
 def test_latent_reconstructs_its_own_training_molecules():
     unique = ["CCO", "CCOC", "CC(=O)O", "c1ccccc1", "CCNCC", "OCCO", "CCCl", "C(C)C", "C1CC1"]
     vocab = sorted({c for s in unique for c in s})
