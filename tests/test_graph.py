@@ -49,6 +49,7 @@ def test_roi_without_ms2_is_isolated():
 
 
 def test_graph_jepa_lowers_the_latent_prediction_loss():
+    torch.manual_seed(0)
     embeddings, traces, catalog = _data()
     nodes, edges = roi_graph(embeddings, traces, catalog, 0.9)
     position = {c: i for i, c in enumerate(nodes.candidate_id)}
