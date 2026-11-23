@@ -23,7 +23,7 @@ import pandas as pd
 import torch
 
 from sna.encoders.dreams import load_dreams
-from sna.paths import ADDUCTS, INSTRUMENTS, POLARITIES
+from sna.spectra import INSTRUMENTS, POLARITIES, SpectraTable
 
 
 def sha256_file(path) -> str:
@@ -48,7 +48,8 @@ def read_ms2(traces_path: str) -> list[dict]:
             keep = intensity > 0
             if not keep.any():
                 continue
-            spectra.append(dict(candidate_id=row.candidate_id, precursor_mz=float(spec.get("precursorMz") or 0.0),
+            spectra.append(dict(candidate_id=row.candidate_id, spectrum_index=len(spectra),
+                               precursor_mz=float(spec.get("precursorMz") or 0.0), rt=float(spec.get("rt") or 0.0),
                                mz=mz[keep], intensity=intensity[keep],
                                polarity=POLARITIES.index(spec["polarity"]) if spec.get("polarity") in POLARITIES else 0))
     return spectra
@@ -96,8 +97,9 @@ def main() -> None:
 
     out = pd.DataFrame({
         "candidate_id": [s["candidate_id"] for s in spectra],
-        "spectrum_index": np.arange(len(spectra)),
+        "spectrum_index": [s["spectrum_index"] for s in spectra],
         "precursor_mz": [s["precursor_mz"] for s in spectra],
+        "rt": [s["rt"] for s in spectra],
         "n_peaks": [len(s["mz"]) for s in spectra],
         "truncated": [len(s["mz"]) > encoder.max_peaks for s in spectra],
         "embedding": [v.tolist() for v in emb],

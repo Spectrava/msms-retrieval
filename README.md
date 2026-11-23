@@ -6,11 +6,12 @@ encoder pretraining, spectrum simulation, and geometry analyses are outside its 
 
 ## Setup
 
-Use Python 3.12 or newer and CUDA GPUs. The paper runs used four A100 80 GB GPUs
+Use Python 3.11 or newer and CUDA GPUs. The paper runs used four A100 80 GB GPUs
 (one for JESTR); using a different GPU count changes the training recipe.
 
 ```bash
-pip install -e '.[test]'
+pip install -e .              # encoder + MS2 scripts
+pip install -e '.[train]'     # also the MassSpecGym training and evaluation harness
 cp .env.example .env
 ```
 
@@ -65,6 +66,24 @@ for ladder rungs, training lengths, and JESTR.
 
 Run `pytest tests` after preparing the data and configuring checkpoint paths.
 Dependencies are pinned to the tested environment in [pyproject.toml](pyproject.toml).
+
+## MS2 spectra from Spectrava exports
+
+`scripts/embed_ms2.py` encodes the MS2 spectra attached to a Spectrava traces Parquet with the
+released DreaMS checkpoint, and `scripts/ms2_retrieval.py` retrieves the nearest spectra and joins
+each hit back to the MS1 trace (sample, RT window, apex m/z) that produced it:
+
+```bash
+python scripts/embed_ms2.py --traces data/7600_traces.parquet --out data/7600_ms2_embeddings.parquet \
+    --ckpt checkpoints/DreaMS_embedding_model_MassSpecGym.ckpt
+python scripts/ms2_retrieval.py --embeddings data/7600_ms2_embeddings.parquet \
+    --traces data/7600_traces.parquet --catalog data/7600_catalog.parquet \
+    --out data/7600_ms2_matches.parquet --k 10
+```
+
+The spectra are attached to candidates by an m/z/RT proximity hypothesis, so every embedding and
+match carries that caveat in its provenance. The staged plan for graph-informed representations and
+structure inference is in [docs/plan.md](docs/plan.md).
 
 ## License
 

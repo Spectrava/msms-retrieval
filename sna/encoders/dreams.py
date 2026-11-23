@@ -1,8 +1,8 @@
 """The pretrained DreaMS spectrum encoder (Bushuiev et al., 2025).
 
-Only the released architecture is ported: fixed Fourier m/z features, a peak MLP and a Fourier MLP
+Only the released architecture is ported: Fourier m/z features read from the checkpoint, a peak MLP and a
 stem, 7 pre-norm Transformer blocks with the parameter-free Graphormer m/z bias, a final LayerNorm.
-Module names follow the checkpoints, so loading is a prefix strip and a strict ``load_state_dict``.
+``load_dreams`` renames the checkpoint's upstream module names to these ones and drops the task heads.
 """
 from __future__ import annotations
 
@@ -15,17 +15,9 @@ from torch import nn
 DIM, DEPTH, HEADS, MLP_DIM = 1024, 7, 8, 4096
 PEAK_DIM, FOURIER_DIM, FOURIER_HIDDEN = 44, 980, 512
 MAX_MZ, MIN_RESOLUTION = 1000.0, 1e-4
+MAX_PEAKS = 128  # DreaMS pads every spectrum to the 128-peak cap of its data format; padding is visible to attention
 DROPOUT = 0.1
 PRECURSOR_INTENSITY = 1.1
-# Checkpoint options that select the code path ported here; a key missing from the checkpoint means this value.
-RELEASED = dict(
-    max_mz=MAX_MZ, hidden_dim=DIM, depth=DEPTH, num_heads=HEADS, mlp_dim=MLP_DIM, peak_branch_dim=PEAK_DIM,
-    fourier_branch_dim=FOURIER_DIM, peak_mlp_depth=1, fourier_mlp_depth=5, fourier_mlp_hidden_dim=FOURIER_HIDDEN,
-    dropout=DROPOUT, attention_dropout=DROPOUT, residual_dropout=DROPOUT, feedforward_dropout=DROPOUT,
-    pre_norm=True, normalization="layernorm", transformer_bias=False, stem_bias=True,
-    graphormer_mz_differences=True, graphormer_parametrized=False, padding_mask_mode="reference-query",
-    fourier_strategy="lin_float_int", fourier_min_resolution=MIN_RESOLUTION, fourier_trainable=False,
-)
 
 
 class MLP(nn.Module):
@@ -96,6 +88,9 @@ class DreaMSEncoder(nn.Module):
     """Spectrum batch (sna.spectra) -> (global [B, D], tokens [B, 1+N, D], token_mask [B, 1+N]).
 
     Token 0 is the precursor (precursor_mz, intensity 1.1); global is its final-norm output.
+    shortcut: upstream DreaMS takes the embedding from the last feed-forward output instead of the
+    final-norm residual stream, so these global vectors are not directly comparable to published
+    DreaMS retrieval scores.
     """
 
     dim = DIM
@@ -133,14 +128,56 @@ class DreaMSEncoder(nn.Module):
         return x[:, 0], x[:, :1 + N], valid[:, :1 + N]
 
 
+def _load_checkpoint(path):
+    """The released checkpoint pickles a `dreams` class we never use. Stub the module so
+    torch.load can unpickle it without installing the upstream DreaMS package.
+    shortcut: the stub only covers these checkpoints; install pluskal-lab/DreaMS if one needs real dreams code."""
+    import sys, types
+    if "dreams" not in sys.modules:
+        for dotted in ("dreams", "dreams.models", "dreams.models.dreams", "dreams.models.dreams.dreams"):
+            sys.modules[dotted] = types.ModuleType(dotted)
+        sys.modules["dreams.models.dreams.dreams"].DreaMS = type("DreaMS", (), {})
+    return torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+
+
+def _released_state(state: dict) -> dict:
+    """Rename the released checkpoint's upstream module names to this port's; the task heads are dropped."""
+    out = {}
+    for key, value in state.items():
+        if not key.startswith("backbone."):
+            continue  # head: the contrastive projection head the encoder never reads
+        name = key[len("backbone."):]
+        if name.split(".")[0] in ("ff_out", "ro_out"):
+            continue  # m/z masking and retention-order heads
+        if name == "fourier_enc.b":
+            out["fourier_features.frequencies"] = value.reshape(-1)
+        elif name.startswith("fourier_enc"):
+            continue  # "Fourier frequencies" is the same tensor as b
+        elif name.startswith(("ff_peak.ff", "ff_fourier.ff")):
+            stem = "peak_encoder" if name.startswith("ff_peak") else "fourier_encoder"
+            out[f"{stem}.layers" + name.split(".ff", 1)[1]] = value
+        elif name.startswith("transformer_encoder.atts"):
+            out[name.replace("transformer_encoder.atts", "blocks").replace(".weights", ".attention.weights")] = value
+        elif name.startswith("transformer_encoder.ffs"):
+            _, i, proj, param = name.split(".")[1:]
+            out[f"blocks.{i}.feedforward.{'input' if proj == 'in_proj' else 'output'}_projection.{param}"] = value
+        elif name.startswith("transformer_encoder.scales"):
+            _, i, param = name.split(".")[1:]
+            i = int(i)
+            norm = "final_norm" if i == 2 * DEPTH else f"blocks.{i // 2}.{'feedforward' if i % 2 else 'attention'}_norm"
+            out[f"{norm}.{param}"] = value
+        else:
+            raise ValueError(f"unexpected checkpoint key {key}")
+    return out
+
+
 def load_dreams(path) -> DreaMSEncoder:
-    """Encoder of a DreaMS checkpoint (SSL or contrastive stage); every other head is dropped."""
-    checkpoint = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
-    config = checkpoint["hyper_parameters"]["model_config"]
-    other = {k: config[k] for k, v in RELEASED.items() if config.get(k, v) != v}
-    if other:
-        raise ValueError(f"{path} is not the released DreaMS architecture: {other}")
-    encoder = DreaMSEncoder(config["max_fragments"])
-    prefix = "model.encoder."
-    encoder.load_state_dict({k[len(prefix):]: v for k, v in checkpoint["state_dict"].items() if k.startswith(prefix)})
+    """Encoder of a released DreaMS checkpoint (SSL or contrastive stage); every other head is dropped."""
+    encoder = DreaMSEncoder(MAX_PEAKS)
+    state = _released_state(_load_checkpoint(path)["state_dict"])
+    if not torch.allclose(state["fourier_features.frequencies"], encoder.fourier_features.frequencies, atol=1e-2):
+        # the released checkpoint's frequencies are a trainable parameter, so they drifted a little
+        # (<= 1.5e-3) during training; a different Fourier strategy would differ by far more.
+        raise ValueError(f"{path} uses Fourier frequencies other than the ported set")
+    encoder.load_state_dict(state)  # strict: any other architecture difference fails here
     return encoder

@@ -6,6 +6,10 @@ https://github.com/pluskal-lab/DreaMS
 sna/jestr.py implements JESTR's retrieval model without DGL:
 https://github.com/HassounLab/JESTR1
 
+Pretrained weights used by scripts/embed_ms2.py: the DreaMS MassSpecGym embedding model from
+https://zenodo.org/records/10997887 (code MIT, weights CC-BY-4.0). The checkpoint is not
+redistributed here; it is downloaded locally and pinned by SHA-256 in each run's provenance.
+
 The upstream MIT notices are retained below. External models and datasets are
 not relicensed by this repository.
 
