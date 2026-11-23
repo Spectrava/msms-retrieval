@@ -181,21 +181,25 @@ matching molecule in a frozen SMILES tower (MoLFormer XL, `--tower chemberta` fo
 measures what the alignment buys:
 
 ```bash
-python scripts/align_spaces.py --tsv data/MassSpecGym1.5.tsv --map linear   # or --map mlp, --probe
+python scripts/align_spaces.py --tsv data/MassSpecGym1.5.tsv --map linear   # or --map mlp, --map contrastive, --probe
 ```
 
-| | linear map | two-layer MLP |
-|---|---|---|
-| cosine(mapped, true molecule) | 0.817 | 0.820 |
-| nearest train molecule | 0.159 | 0.177 |
-| raw spectrum nearest neighbour | 0.184 | 0.184 |
-| ceiling: nearest train molecule to the *true* molecule | 0.386 | 0.386 |
-| nearest among the val molecules themselves | 0.176 (0.9% exact) | 0.199 (1.5% exact) |
+| | linear map | two-layer MLP | contrastive heads |
+|---|---|---|---|
+| cosine(mapped, true molecule) | 0.817 | 0.820 | 0.375 |
+| same-space random molecule | 0.727 | 0.715 | 0.034 |
+| nearest train molecule | 0.159 | 0.177 | 0.173 |
+| raw spectrum nearest neighbour | 0.184 | 0.184 | 0.184 |
+| ceiling: nearest train molecule to the *true* molecule | 0.386 | 0.386 | 0.386 |
+| nearest among the val molecules themselves | 0.176 (0.9% exact) | 0.199 (1.5% exact) | 0.247 (5.7% exact) |
 
-The cosine looks good next to a random molecule pair (0.598), but the pooled MoLFormer space is
-anisotropic: the nearest *other* molecule to any given molecule sits at cosine 0.888 (Tanimoto 0.456).
-A mapped latent at 0.817 is closer to a random neighbour than to the molecule it came from, which is
-why retrieval does not improve.
+The regression maps look good in absolute terms (0.817 against a 0.727 random-molecule floor), but the pooled MoLFormer
+space is anisotropic: the nearest *other* molecule to any given molecule sits at cosine 0.888 (Tanimoto 0.456). The
+mapped latent is only 0.09 above the floor, so it is further from the molecule it came from than that molecule is from
+its nearest neighbour - which is why retrieval does not improve. The contrastive heads win differently: they throw away most of the space (a random pair is only
+0.034) so the true molecule stands out by a factor of eleven, and they recover the exact molecule 5.7% of the time -
+but the directions they keep are the discriminative ones, so retrieving a *similar* molecule is still no better than
+cosine in the raw spectrum space.
 
 `--probe` trains the same char-LSTM on the molecule latents instead of the spectra: 35.3% of the
 outputs parse, mean Tanimoto 0.177 on unseen molecules, and 0.5% exact reproduction of the molecules

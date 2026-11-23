@@ -18,7 +18,7 @@ import numpy as np
 from transformers import AutoTokenizer
 
 from sna import paths
-from sna.align import canonical, fingerprints, fit_mlp, nearest, probe_decoder, ridge, tanimoto
+from sna.align import canonical, fingerprints, fit_contrastive, fit_mlp, nearest, probe_decoder, ridge, tanimoto
 from sna.data import read_msg_tsv
 from sna.towers import Tower
 
@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument("--out", default=None)
     parser.add_argument("--tower", default="molformer", choices=sorted(paths.TOWERS))
     parser.add_argument("--lam", type=float, default=1e3)
-    parser.add_argument("--map", choices=("linear", "mlp"), default="linear")
+    parser.add_argument("--map", choices=("linear", "mlp", "contrastive"), default="linear")
     parser.add_argument("--probe", action="store_true", help="train the char-LSTM on the molecule latents")
     args = parser.parse_args()
     args.out = args.out or f"data/alignment_{args.tower}_{args.map}.npz"
@@ -90,23 +90,30 @@ def main() -> None:
     np.add.at(sums, mol_of_row, z_train)
     z_unique_n = unit(sums / np.bincount(mol_of_row)[:, None])
 
-    W = ridge(z_train.astype(np.float64), m_train[mol_of_row], args.lam) if args.map == "linear" else None
-    mapped = unit(z_val @ W) if args.map == "linear" else unit(fit_mlp(z_train, m_train[mol_of_row])(z_val))
+    W = None
+    if args.map == "linear":
+        W = ridge(z_train.astype(np.float64), m_train[mol_of_row], args.lam)
+        mapped, index, index_val = unit(z_val @ W), m_train_n, m_val_n
+    elif args.map == "mlp":
+        mapped, index, index_val = unit(fit_mlp(z_train, m_train[mol_of_row])(z_val)), m_train_n, m_val_n
+    else:
+        spectrum, molecule = fit_contrastive(z_train, m_train[mol_of_row])
+        mapped, index, index_val = unit(spectrum(z_val)), unit(molecule(m_train)), unit(molecule(m_val))
 
-    align_cos = float((mapped * m_val_n).sum(1).mean())
-    pairs = float((m_val_n[rng.integers(len(m_val_n), size=2000)] *
-                   m_train_n[rng.integers(len(m_train_n), size=2000)]).sum(1).mean())
-    retrieval, sims = nearest(mapped, m_train_n, fp_train, fp_val)
+    align_cos = float((mapped * index_val).sum(1).mean())
+    # the same-space noise floor: a mapped spectrum against a random molecule's adapted vector
+    aligned_floor = float((mapped * index_val[rng.integers(len(index_val), size=len(mapped))]).sum(1).mean())
+    retrieval, sims = nearest(mapped, index, fp_train, fp_val)
     ceiling, _ = nearest(m_val_n, m_train_n, fp_train, fp_val)
     raw, _ = nearest(z_val_n, z_unique_n, fp_train, fp_val)
     # alignment quality against the val molecules themselves: the ceiling here is 1.0, so this
     # isolates the map from the fact that no train molecule is the answer
-    self_retrieval, self_sims = nearest(mapped, m_val_n, fp_val, fp_val)
+    self_retrieval, self_sims = nearest(mapped, index_val, fp_val, fp_val)
     exact = float((self_sims == 1.0).mean())
     random = float(tanimoto(fp_train[rng.integers(len(fp_train), size=2000)],
                             fp_val[rng.integers(len(fp_val), size=2000)]).mean())
 
-    print(f"cosine(mapped, true molecule)        {align_cos:.3f}   (random molecule pair: {pairs:.3f})")
+    print(f"cosine(mapped, true molecule)        {align_cos:.3f}   (random molecule in the same space: {aligned_floor:.3f})")
     print(f"mapped nearest train molecule        {retrieval:.3f} Tanimoto")
     print(f"raw spectrum nearest neighbour       {raw:.3f} Tanimoto")
     print(f"ceiling (true molecule's nearest)    {ceiling:.3f} Tanimoto")
@@ -122,7 +129,7 @@ def main() -> None:
               f"molecules, {exact:.1%} exact on its own training molecules")
     np.savez(args.out, W=W, tower=args.tower, lam=args.lam, identifier=val_id,
             smiles=np.array(val_smiles), mapped=mapped, sims=sims,
-            ceiling=ceiling, raw=raw, align_cos=align_cos, random=random)
+            ceiling=ceiling, raw=raw, align_cos=align_cos, aligned_floor=aligned_floor, random=random)
     print(f"wrote {args.out} in {time.time() - started:.0f}s")
 
 

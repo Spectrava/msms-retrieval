@@ -6,10 +6,14 @@ the cheapest possible test of whether the two spaces can be lined up at all.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
+import torch.nn.functional as F
 from rdkit import Chem
 from rdkit.Chem import DataStructs, rdFingerprintGenerator
+from torch import nn
 
 MORGAN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
@@ -73,6 +77,42 @@ def fit_mlp(z: np.ndarray, m: np.ndarray, hidden: int = 1024, epochs: int = 20,
         with torch.no_grad():
             return net(torch.tensor(x, dtype=torch.float32).cuda()).cpu().numpy()
     return predict
+
+
+def fit_contrastive(z: np.ndarray, m: np.ndarray, hidden: int = 1024, out: int = 512,
+                    epochs: int = 5, batch: int = 1024, seed: int = 0) -> callable:
+    """Two adapter heads trained with in-batch InfoNCE: the alignment the paper actually uses.
+
+    Unlike the regression maps this one is trained to *rank* the right molecule, so it is the
+    fair test of whether an aligned space can beat cosine in the raw spectrum space.
+    """
+    torch.manual_seed(seed)
+    head = lambda dim: nn.Sequential(nn.Linear(dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
+                                     nn.Linear(hidden, out)).cuda()
+    spectrum, molecule = head(z.shape[1]), head(m.shape[1])
+    tau = nn.Parameter(torch.tensor(math.log(0.07)))
+    zt, mt = torch.tensor(z, dtype=torch.float32).cuda(), torch.tensor(m, dtype=torch.float32).cuda()
+    opt = torch.optim.Adam(list(spectrum.parameters()) + list(molecule.parameters()) + [tau], 1e-3)
+    for epoch in range(epochs):
+        order = torch.randperm(len(zt), device="cuda")
+        loss = 0.0
+        for i in range(0, len(zt), batch):
+            r = order[i:i + batch]
+            s = F.normalize(spectrum(zt[r]), dim=1)
+            mol = F.normalize(molecule(mt[r]), dim=1)
+            obj = F.cross_entropy(s @ mol.T / tau.exp(), torch.arange(len(r), device="cuda"))
+            opt.zero_grad(); obj.backward(); opt.step()
+            loss += obj.item() * len(r)
+        tau.data = torch.log(torch.exp(tau).clamp(min=0.01))
+        print(f"[contrastive] epoch {epoch} InfoNCE loss {loss / len(zt):.3f}", flush=True)
+    spectrum.eval(); molecule.eval()
+
+    def predict(net):
+        def f(x):
+            with torch.no_grad():
+                return F.normalize(net(torch.tensor(x, dtype=torch.float32).cuda()), dim=1).cpu().numpy()
+        return f
+    return predict(spectrum), predict(molecule)
 
 
 def nearest(query: np.ndarray, index: np.ndarray, fp: np.ndarray, truth: np.ndarray,

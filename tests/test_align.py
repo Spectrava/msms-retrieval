@@ -1,8 +1,9 @@
-"""The ridge map recovers a linear relationship, a rotation of the query space cannot change
-which indexed molecule is nearest, and the string Tanimoto agrees with the bit-matrix one."""
+"""The ridge map recovers a linear relationship, the contrastive heads learn an isometry, a
+rotation of the query space cannot change which indexed molecule is nearest, and the string
+Tanimoto agrees with the bit-matrix one."""
 import numpy as np
 
-from sna.align import nearest, ridge, smiles_tanimoto, tanimoto
+from sna.align import fit_contrastive, nearest, ridge, smiles_tanimoto, tanimoto
 
 
 def test_ridge_recovers_a_linear_map():
@@ -36,6 +37,15 @@ def test_nearest_chunking_matches_a_single_pass():
     _, chunked = nearest(query, index, fp, truth, chunk=2)
     _, whole = nearest(query, index, fp, truth)
     assert np.allclose(chunked, whole)
+
+
+def test_contrastive_heads_learn_an_isometry():
+    rng = np.random.default_rng(3)
+    z = rng.normal(size=(400, 8))
+    m = z @ np.linalg.qr(rng.normal(size=(8, 6)))[0]  # an exact rotation into another space
+    spectrum, molecule = fit_contrastive(z, m, hidden=128, out=32, epochs=10, batch=200)
+    sims = molecule(m) @ spectrum(z).T
+    assert (sims.argmax(0) == np.arange(400)).mean() > 0.9
 
 
 def test_smiles_tanimoto_matches_the_bit_matrices():
