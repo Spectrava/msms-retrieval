@@ -107,6 +107,29 @@ library spectra, then retrieve) recovers the original spectrum as top-1 for 95.7
 so the encoder is robust; the weak cross-library scores reflect the data - the MS2 attachment is a
 proximity hypothesis and the 7600 spectra are denser and noisier than the library entries.
 
+## MinHash/LSH baseline (Spectrava/molecule_lsh)
+
+`sna/lsh.py` reproduces the org repo's strategy exactly: m/z digitised into 1000 bins of 1 unit,
+intensities normalised to sum 100, datasketch WeightedMinHash (128 hashes, seed 42), library spectra
+of the same SMILES merged into one peak set, ranking by exact Jaccard (fraction of equal hash
+pairs); the `MinHashLSHForest` only cuts candidates. `scripts/compare_lsh.py` runs both this and
+DreaMS cosine on the same spectra (cosine aggregated to the molecule with a max):
+
+```bash
+python scripts/compare_lsh.py --traces 7600_traces.parquet --embeddings data/7600_ms2_embeddings.parquet \
+    --library-embeddings data/plasma_ms2_embeddings.parquet --msp BioMSMS-Pos-PlaSMA.msp BioMSMS-Neg-PlaSMA.msp
+```
+
+On the 7600 spectra vs the PlaSMA library the two strategies disagree: Jaccard top-1 averages 0.40,
+cosine 0.54; they pick the same top-1 molecule only 3.3% of the time and their top-1 scores are
+uncorrelated (-0.11). The LSH forest returns ~85 candidates per query but misses the exact top-1
+about half the time (54% recall). In the library self-test cosine separates related spectra better
+(nearest-other mean 0.66, 48 pairs >= 0.9) than Jaccard (0.44, 14 pairs >= 0.9). Dropping 30% of a
+query's peaks keeps its top-1 molecule for 41% of queries under Jaccard and 34% under cosine.
+Jaccard counts binned-peak overlap - dense, noisy spectra accumulate bins that match almost
+anything - while the embedding captures peak-pattern shape. Cosine is the better ranker; LSH is the
+cheaper candidate filter (no GPU, no model, signatures in seconds).
+
 ## ROI graph and graph JEPA
 
 `sna/graph.py` builds the ROI graph: one node per trace, an edge when two traces' pooled MS2
