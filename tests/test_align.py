@@ -1,0 +1,47 @@
+"""The ridge map recovers a linear relationship, a rotation of the query space cannot change
+which indexed molecule is nearest, and the string Tanimoto agrees with the bit-matrix one."""
+import numpy as np
+
+from sna.align import nearest, ridge, smiles_tanimoto, tanimoto
+
+
+def test_ridge_recovers_a_linear_map():
+    rng = np.random.default_rng(0)
+    z = rng.normal(size=(500, 8))
+    W = rng.normal(size=(8, 6))
+    m = z @ W + 0.01 * rng.normal(size=(500, 6))
+    assert np.allclose(ridge(z, m, 1e-6), W, atol=1e-2)
+
+
+def test_nearest_is_invariant_to_rotation():
+    rng = np.random.default_rng(1)
+    index = rng.normal(size=(20, 6))
+    query = rng.normal(size=(5, 6))
+    fp = rng.integers(2, size=(20, 8)).astype(np.uint8)
+    truth = fp[:5]  # the true molecule for each query
+    _, sims = nearest(query, index, fp, truth)
+    R = np.linalg.qr(rng.normal(size=(6, 6)))[0]
+    _, rotated = nearest(query @ R, index @ R, fp, truth)
+    assert np.allclose(sims, rotated)
+    assert tanimoto(fp[:1], fp[:1])[0] == 1.0
+    assert tanimoto(np.zeros((1, 8), np.uint8), np.zeros((1, 8), np.uint8)) == 0.0
+
+
+def test_nearest_chunking_matches_a_single_pass():
+    rng = np.random.default_rng(2)
+    index = rng.normal(size=(30, 6))
+    query = rng.normal(size=(7, 6))
+    fp = rng.integers(2, size=(30, 8)).astype(np.uint8)
+    truth = fp[:7]
+    _, chunked = nearest(query, index, fp, truth, chunk=2)
+    _, whole = nearest(query, index, fp, truth)
+    assert np.allclose(chunked, whole)
+
+
+def test_smiles_tanimoto_matches_the_bit_matrices():
+    from sna.align import fingerprints
+    fp = fingerprints(["CCO", "CCOC", "xyz"])
+    assert smiles_tanimoto("CCO", "CCO") == 1.0
+    assert smiles_tanimoto("CCO", "xyz") == 0.0  # RDKit cannot parse it
+    assert 0.0 < smiles_tanimoto("CCO", "CCOC") < 1.0
+    assert abs(smiles_tanimoto("CCO", "CCOC") - tanimoto(fp[:1], fp[1:2])[0]) < 1e-9

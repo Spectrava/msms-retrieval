@@ -174,6 +174,41 @@ observed precursor (±0.05, as [M+H]+ or [M+Na]+).
 The DreaMS embedding is discriminative: it is a good retrieval key and a weak generative one.
 Generated SMILES are hypotheses to be reviewed, never identifications.
 
+## Aligning the spectrum space with a molecule tower
+
+`scripts/align_spaces.py` fits a map from the DreaMS embedding to the pooled embedding of the
+matching molecule in a frozen SMILES tower (MoLFormer XL, `--tower chemberta` for the other) and
+measures what the alignment buys:
+
+```bash
+python scripts/align_spaces.py --tsv data/MassSpecGym1.5.tsv --map linear   # or --map mlp, --probe
+```
+
+| | linear map | two-layer MLP |
+|---|---|---|
+| cosine(mapped, true molecule) | 0.817 | 0.820 |
+| nearest train molecule | 0.159 | 0.177 |
+| raw spectrum nearest neighbour | 0.184 | 0.184 |
+| ceiling: nearest train molecule to the *true* molecule | 0.386 | 0.386 |
+| nearest among the val molecules themselves | 0.176 (0.9% exact) | 0.199 (1.5% exact) |
+
+The cosine looks good next to a random molecule pair (0.598), but the pooled MoLFormer space is
+anisotropic: the nearest *other* molecule to any given molecule sits at cosine 0.888 (Tanimoto 0.456).
+A mapped latent at 0.817 is closer to a random neighbour than to the molecule it came from, which is
+why retrieval does not improve.
+
+`--probe` trains the same char-LSTM on the molecule latents instead of the spectra: 35.3% of the
+outputs parse, mean Tanimoto 0.177 on unseen molecules, and 0.5% exact reproduction of the molecules
+it was trained on. A pooled transformer embedding is not a generative latent space, so the
+bottleneck is the latent, not the decoder.
+
+The graph autoencoder in [mcunow/graph-matching](https://github.com/mcunow/graph-matching) has the
+right shape - latent plus one-shot graph decoder with a permutation-invariant loss - but its decoder
+is fixed to 9 heavy atoms and C/N/O/F, and only 2.4% of MassSpecGym molecules have ≤9 heavy atoms
+(2.1% also contain nothing else). It cannot cover this chemistry without rewriting the decoder.
+
+An aligned space is therefore useful for *ranking* candidate structures, not for producing them.
+
 ## License
 
 [MIT](LICENSE). Upstream acknowledgments and license notices are in
