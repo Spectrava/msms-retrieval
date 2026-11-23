@@ -85,6 +85,26 @@ The spectra are attached to candidates by an m/z/RT proximity hypothesis, so eve
 match carries that caveat in its provenance. The staged plan for graph-informed representations and
 structure inference is in [docs/plan.md](docs/plan.md).
 
+## ROI graph and graph JEPA
+
+`sna/graph.py` builds the ROI graph: one node per trace, an edge when two traces' pooled MS2
+embeddings reach a cosine threshold. Only traces that actually have MS2 can be linked, and
+`--within-sample` / `--no-within-sample` and `--between-samples` / `--no-between-samples` choose
+which kind of edge to draw. `scripts/graph_jepa.py` then trains a small JEPA head that predicts a
+ROI's frozen MS2 embedding from its neighbours' latents:
+
+```bash
+python scripts/graph_jepa.py --embeddings data/7600_ms2_embeddings.parquet \
+    --traces data/7600_traces.parquet --catalog data/7600_catalog.parquet \
+    --out data/7600_graph_latents.parquet --threshold 0.9
+```
+
+On the 7600 export at threshold 0.9: 2,431 of 42,354 ROIs have MS2, 163 edges (7 within-sample,
+156 between samples), largest component 12 ROIs, latent prediction loss 1.05 -> 0.21. The loss
+carries a collapse penalty (mean pairwise cosine of the latents): without it the model maps every
+ROI to one vector. The output Parquet has one row per ROI with degree, component and graph latent
+(null for ROIs without MS2), plus `.edges.parquet` and `.provenance.json`.
+
 ## License
 
 [MIT](LICENSE). Upstream acknowledgments and license notices are in

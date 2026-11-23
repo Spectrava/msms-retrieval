@@ -54,6 +54,17 @@ Honesty rule: trace-to-spectrum edges are proximity hypotheses. Any graph model 
 edge's m/z/RT tolerance and the count of spectra behind it in its provenance, and a representation
 must never be trained on an edge it is later asked to confirm.
 
+Done for step 1 and 2: `sna/graph.py` pools each trace's MS2 embeddings into one unit feature and
+draws an edge when two such features reach a cosine threshold; `--within-sample` and
+`--between-samples` flag the two edge kinds on or off (both off raises). `scripts/graph_jepa.py`
+trains a JEPA head that predicts a ROI's frozen embedding from its neighbours' latents. On the 7600
+export at threshold 0.9: 163 edges (7 within-sample, 156 between samples) over 2,431 MS2-measured
+ROIs, largest component 12, loss 1.05 -> 0.21. The loss needs a collapse penalty: unpenalised, the
+head maps every ROI to one vector (mean pairwise cosine 0.99); penalised, graph latents stay
+separated (0.001) and the top-1 apex-m/z agreement is 29.0% vs 31.8% frozen. With only 163 edges
+this is a proof of mechanism, not a trained model - OT_raw MS2 and reference-library edges are what
+make the graph worth training on.
+
 ## Stage 4 - retrieval database
 
 - Storage: DuckDB over Parquet (same shape as the backend), tables `spectra`, `embeddings`,
