@@ -85,6 +85,28 @@ The spectra are attached to candidates by an m/z/RT proximity hypothesis, so eve
 match carries that caveat in its provenance. The staged plan for graph-informed representations and
 structure inference is in [docs/plan.md](docs/plan.md).
 
+## Reference MS2 libraries
+
+`sna/library.py` reads NIST MSP files (entries without a precursor are skipped; metadata the file
+does not carry is recorded as unknown, never guessed), `scripts/embed_library.py` encodes them with
+the same DreaMS checkpoint, and `scripts/ms2_retrieval.py --library` matches sample spectra against
+the library, comparing only same-polarity pairs:
+
+```bash
+python scripts/embed_library.py --msp BioMSMS-Pos-PlaSMA.msp BioMSMS-Neg-PlaSMA.msp \
+    --out data/plasma_ms2_embeddings.parquet \
+    --ckpt checkpoints/DreaMS_embedding_model_MassSpecGym.ckpt
+python scripts/ms2_retrieval.py --embeddings data/7600_ms2_embeddings.parquet \
+    --library data/plasma_ms2_embeddings.parquet --out data/7600_vs_plasma.parquet --k 5
+```
+
+Against the PlaSMA plant-metabolite library (3,948 spectra) the 2,736 spectra from the 7600 export
+match weakly: top-1 similarity mean 0.53, none reaching 0.9, and even queries whose precursor sits
+within 0.05 of a library precursor stay around 0.4-0.65. A control (drop 30% of the peaks of
+library spectra, then retrieve) recovers the original spectrum as top-1 for 95.7% of the queries,
+so the encoder is robust; the weak cross-library scores reflect the data - the MS2 attachment is a
+proximity hypothesis and the 7600 spectra are denser and noisier than the library entries.
+
 ## ROI graph and graph JEPA
 
 `sna/graph.py` builds the ROI graph: one node per trace, an edge when two traces' pooled MS2

@@ -15,7 +15,7 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from sna.retrieval import match_table, ms1_context
+from sna.retrieval import library_match, match_table, ms1_context
 
 
 def report(matches: pd.DataFrame, k: int) -> None:
@@ -39,16 +39,36 @@ def report(matches: pd.DataFrame, k: int) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--embeddings", required=True)
-    ap.add_argument("--traces", required=True)
-    ap.add_argument("--catalog", required=True)
+    ap.add_argument("--traces", help="Spectrava traces Parquet (self-match mode only)")
+    ap.add_argument("--catalog", help="Spectrava MS1 catalog Parquet (self-match mode only)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--k", type=int, default=10)
+    ap.add_argument("--library", help="reference library embeddings from scripts/embed_library.py; "
+                                      "queries then match against the library instead of each other")
     args = ap.parse_args()
 
     embeddings = pd.read_parquet(args.embeddings)
-    matches = match_table(embeddings, ms1_context(pd.read_parquet(args.traces), pd.read_parquet(args.catalog)), args.k)
+    if args.library:
+        matches = library_match(embeddings, pd.read_parquet(args.library), args.k)
+        best = matches.iloc[np.arange(len(matches) // args.k) * args.k]
+        print(f"{len(best)} queries against {len(pd.read_parquet(args.library))} library spectra "
+              f"(only same-polarity pairs compared)")
+        print(f"top-1 similarity: mean {best.similarity.mean():.3f}, median {best.similarity.median():.3f}, "
+              f"max {best.similarity.max():.3f}")
+        print(f"queries whose top-1 hit reaches 0.9: {(best.similarity >= 0.9).mean():.1%}")
+        print(f"top-1 hits sharing the precursor m/z (+-0.05): {best.same_precursor.mean():.1%}")
+        strong = best[best.similarity >= 0.9]
+        print(f"\n{len(strong)} queries with a top-1 library hit at >= 0.9; strongest 10:")
+        for row in strong.sort_values("similarity", ascending=False).head(10).itertuples():
+            print(f"  {row.similarity:.4f}  query {row.query_precursor_mz:.4f} @ {row.query_rt:.1f}s "
+                  f"(candidate {row.query_candidate_id}) -> {row.name} [{row.formula}] "
+                  f"precursor {row.match_precursor_mz:.4f}")
+    else:
+        if not (args.traces and args.catalog):
+            ap.error("--traces and --catalog are needed when no --library is given")
+        matches = match_table(embeddings, ms1_context(pd.read_parquet(args.traces), pd.read_parquet(args.catalog)), args.k)
+        report(matches, args.k)
     matches.to_parquet(args.out)
-    report(matches, args.k)
     print(f"wrote {len(matches)} matches to {args.out}")
 
 

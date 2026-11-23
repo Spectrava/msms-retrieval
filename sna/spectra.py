@@ -27,6 +27,23 @@ META = ("precursor_mz", "adduct", "charge", "polarity", "instrument", "ce", "ce_
 AUGMENT = dict(peak_dropout=0.2, intensity_sigma=0.3, mz_ppm=5.0)
 
 
+def arrays_from_spectra(spectra: list[dict]) -> dict:
+    """Flat CSR peak arrays from a list of dicts (mz, intensity, precursor_mz, polarity index).
+    Acquisition metadata the source does not carry is set to "unknown", never guessed."""
+    counts = [len(s["mz"]) for s in spectra]
+    return dict(
+        offsets=np.concatenate([[0], np.cumsum(counts)]).astype(np.int64),
+        mz=np.concatenate([s["mz"] for s in spectra]),
+        intensity=np.concatenate([s["intensity"] for s in spectra]),
+        precursor_mz=np.array([s["precursor_mz"] for s in spectra], np.float32),
+        adduct=np.array([s.get("adduct", 0) for s in spectra], np.int64),
+        charge=np.ones(len(spectra), np.int64),
+        polarity=np.array([s.get("polarity", 0) for s in spectra], np.int64),
+        instrument=np.full(len(spectra), INSTRUMENTS.index("Unknown"), np.int64),
+        ce=np.zeros(len(spectra), np.float32), ce_valid=np.zeros(len(spectra), bool),
+    )
+
+
 def read_msg_tsv(path) -> dict[str, np.ndarray]:
     """The official TSV as flat arrays, peaks in CSR form (``offsets``).
 

@@ -23,7 +23,7 @@ import pandas as pd
 import torch
 
 from sna.encoders.dreams import load_dreams
-from sna.spectra import INSTRUMENTS, POLARITIES, SpectraTable
+from sna.spectra import POLARITIES, SpectraTable, arrays_from_spectra
 
 
 def sha256_file(path) -> str:
@@ -38,7 +38,7 @@ def read_ms2(traces_path: str) -> list[dict]:
     """One dict per MS2 spectrum that actually exists, in file order."""
     spectra = []
     for row in pd.read_parquet(traces_path)[["candidate_id", "ms2_json"]].itertuples():
-        for spec in json.loads(row.ms2_json or "[]"):
+        for i, spec in enumerate(json.loads(row.ms2_json or "[]")):
             if not spec:
                 continue
             mz = np.asarray(spec.get("mz", []), np.float32)
@@ -48,27 +48,11 @@ def read_ms2(traces_path: str) -> list[dict]:
             keep = intensity > 0
             if not keep.any():
                 continue
-            spectra.append(dict(candidate_id=row.candidate_id, spectrum_index=len(spectra),
+            spectra.append(dict(candidate_id=row.candidate_id, spectrum_index=i,
                                precursor_mz=float(spec.get("precursorMz") or 0.0), rt=float(spec.get("rt") or 0.0),
                                mz=mz[keep], intensity=intensity[keep],
                                polarity=POLARITIES.index(spec["polarity"]) if spec.get("polarity") in POLARITIES else 0))
     return spectra
-
-
-def to_arrays(spectra: list[dict]) -> dict:
-    """Flat CSR peak arrays in the shape sna.spectra expects, with unknown acquisition metadata."""
-    counts = [len(s["mz"]) for s in spectra]
-    return dict(
-        offsets=np.concatenate([[0], np.cumsum(counts)]).astype(np.int64),
-        mz=np.concatenate([s["mz"] for s in spectra]),
-        intensity=np.concatenate([s["intensity"] for s in spectra]),
-        precursor_mz=np.array([s["precursor_mz"] for s in spectra], np.float32),
-        adduct=np.zeros(len(spectra), np.int64),                      # <unk>: not recorded in the export
-        charge=np.ones(len(spectra), np.int64),                       # DreaMS does not read this
-        polarity=np.array([s["polarity"] for s in spectra], np.int64),
-        instrument=np.full(len(spectra), INSTRUMENTS.index("Unknown"), np.int64),
-        ce=np.zeros(len(spectra), np.float32), ce_valid=np.zeros(len(spectra), bool),
-    )
 
 
 def main() -> None:
@@ -84,8 +68,7 @@ def main() -> None:
     spectra = read_ms2(args.traces)
     if not spectra:
         raise SystemExit(f"no MS2 spectra in {args.traces}")
-    data = to_arrays(spectra)
-    table = SpectraTable(data, device=args.device)
+    table = SpectraTable(arrays_from_spectra(spectra), device=args.device)
 
     vectors, t0 = [], time.time()
     with torch.inference_mode():
@@ -100,6 +83,7 @@ def main() -> None:
         "spectrum_index": [s["spectrum_index"] for s in spectra],
         "precursor_mz": [s["precursor_mz"] for s in spectra],
         "rt": [s["rt"] for s in spectra],
+        "polarity": [s["polarity"] for s in spectra],
         "n_peaks": [len(s["mz"]) for s in spectra],
         "truncated": [len(s["mz"]) > encoder.max_peaks for s in spectra],
         "embedding": [v.tolist() for v in emb],

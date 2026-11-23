@@ -33,6 +33,28 @@ def ms1_context(traces: pd.DataFrame, catalog: pd.DataFrame) -> pd.DataFrame:
             .merge(apex[["candidate_id", "ms1_mz", "ms1_rt", "ms1_intensity"]], on="candidate_id"))
 
 
+def library_match(query: pd.DataFrame, library: pd.DataFrame, k: int = 5) -> pd.DataFrame:
+    """Top-k library spectra for every query. Spectra of different polarity are never compared -
+    the encoder embeds positive and negative MS2 differently, so a cross-polarity cosine is
+    meaningless. The library side carries the metadata the library actually states."""
+    sim = unit(np.stack(query["embedding"])) @ unit(np.stack(library["embedding"])).T
+    sim[query["polarity"].to_numpy()[:, None] != library["polarity"].to_numpy()[None, :]] = -1.0
+    order = (-sim).argsort(1, kind="stable")[:, :k]
+    sims = np.take_along_axis(sim, order, 1)
+    rows = np.repeat(np.arange(len(query)), k)
+    lib = library.iloc[order.ravel()].reset_index(drop=True)
+    return pd.DataFrame({
+        "query_candidate_id": query["candidate_id"].to_numpy()[rows],
+        "query_spectrum": query["spectrum_index"].to_numpy()[rows],
+        "query_precursor_mz": query["precursor_mz"].to_numpy()[rows],
+        "query_rt": query["rt"].to_numpy()[rows],
+        "library": lib["library"], "name": lib["name"], "formula": lib["formula"],
+        "smiles": lib["smiles"], "match_precursor_mz": lib["precursor_mz"],
+        "similarity": sims.ravel(),
+        "same_precursor": np.abs(query["precursor_mz"].to_numpy()[rows] - lib["precursor_mz"].to_numpy()) < 0.05,
+    })
+
+
 def match_table(embeddings: pd.DataFrame, context: pd.DataFrame, k: int = 10) -> pd.DataFrame:
     """One row per (query spectrum, neighbour spectrum) with both sides' MS1 trace context."""
     order, sim = neighbours(np.stack(embeddings["embedding"]), k)
