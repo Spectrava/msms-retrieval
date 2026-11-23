@@ -174,6 +174,46 @@ observed precursor (±0.05, as [M+H]+ or [M+Na]+).
 The DreaMS embedding is discriminative: it is a good retrieval key and a weak generative one.
 Generated SMILES are hypotheses to be reviewed, never identifications.
 
+## Training a generative embedding
+
+`sna/genembed.py` and `scripts/gen_embed.py` build the embedding generatively instead of
+retrieval-wise: the frozen DreaMS spectrum embedding is pushed through an encoder into a bottleneck
+latent, and a four-layer causal transformer is trained *jointly* to write the SMILES of that
+spectrum from the latent. The latent is invertible by construction - it is the first token of the
+decoder's stream - so the test is whether the spectrum space carries enough structure to be written
+back out, not whether a similar spectrum can be found.
+
+```bash
+python scripts/gen_embed.py --tsv data/MassSpecGym1.5.tsv --latent 256 --epochs 10 \
+    --candidates 8 --out data/generative_embedding_latent256.pt
+```
+
+Mean Tanimoto between the generated and the true molecule:
+
+| latent | training spectra | held-out spectra | wrong spectrum | retrieval ceiling |
+|---|---|---|---|---|
+| 128 | 0.664 | 0.165 | - | 0.187 |
+| 256 | 0.697 | 0.164 | 0.109 | 0.188 |
+
+87% of training and 64% of held-out generated SMILES parse; 41% of training spectra reproduce their
+own molecule exactly (held-out molecules are disjoint from training, so an exact match is
+impossible by construction). The latent is carrying something - decoding the *wrong* spectrum's
+latent scores 0.109 against 0.164 - but its width is not the limit (128 and 256 are
+indistinguishable), and generation never reaches the retrieval ceiling: copying the nearest training
+spectrum's molecule scores 0.188. The model memorises the training set (next-character loss 0.041
+train, 0.545 held-out) and on unseen molecules writes a plausible structure no better than the
+char-LSTM conditioned on the raw embedding (0.159).
+
+Sampling only helps as a filter: with eight temperature-1.0 candidates per spectrum, 9,748 of
+21,888 proposals parse, and 116 of the 2,736 MS2 spectra in the 7600 export have at least one
+proposal whose monoisotopic mass fits the observed precursor (±0.05, as [M+H]+ or [M+Na]+), against
+21 for the greedy generation alone. That is a shortlist for a reviewer, not an identification.
+
+The honest reading: a generative latent bolted on top of discriminative DreaMS features does not
+extract more structure than plain retrieval. If generation is the goal, the encoder itself has to be
+trained generatively - predict the spectrum from the structure, or a joint spectrum/structure
+objective - rather than the decoder being fitted onto a frozen discriminative embedding.
+
 ## Aligning the spectrum space with a molecule tower
 
 `scripts/align_spaces.py` fits a map from the DreaMS embedding to the pooled embedding of the
