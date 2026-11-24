@@ -57,8 +57,8 @@ def mlp_readout(name: str, z_train: np.ndarray, z_val: np.ndarray, train_fp: np.
     latent is. If a nonlinear readout cannot do better either, the chemistry is not in there."""
     zt = torch.tensor(z_train, device="cuda")
     zv = torch.tensor(z_val, device="cuda")
-    bits = torch.tensor(train_fp, device="cuda")
-    counts = torch.tensor(train_counts, device="cuda")
+    bits = torch.tensor(train_fp, device="cuda", dtype=torch.float32)
+    counts = torch.tensor(train_counts, device="cuda", dtype=torch.float32)
     model = nn.Sequential(nn.Linear(z_train.shape[1], hidden), nn.ReLU(),
                           nn.Linear(hidden, train_fp.shape[1] + train_counts.shape[1])).cuda()
     opt = torch.optim.Adam(model.parameters(), 1e-3)
