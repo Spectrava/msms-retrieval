@@ -209,10 +209,28 @@ Sampling only helps as a filter: with eight temperature-1.0 candidates per spect
 proposal whose monoisotopic mass fits the observed precursor (±0.05, as [M+H]+ or [M+Na]+), against
 21 for the greedy generation alone. That is a shortlist for a reviewer, not an identification.
 
-The honest reading: a generative latent bolted on top of discriminative DreaMS features does not
-extract more structure than plain retrieval. If generation is the goal, the encoder itself has to be
-trained generatively - predict the spectrum from the structure, or a joint spectrum/structure
-objective - rather than the decoder being fitted onto a frozen discriminative embedding.
+### Training the encoder from the spectrum itself
+
+`--from-peaks` drops DreaMS entirely: the input is the spectrum binned into 1000 one-unit m/z bins,
+the encoder is a single linear layer, and the latent is additionally scored on rebuilding those bins,
+so it is checked against the observation and not only against a label.
+
+| latent | training spectra | held-out spectra | wrong spectrum | retrieval ceiling | rebuilds the spectrum (cosine) |
+|---|---|---|---|---|---|
+| 256 | 0.456 | 0.120 | 0.103 | 0.114 | 0.462 |
+| 512 | 0.501 | 0.118 | 0.099 | 0.114 | 0.573 |
+
+Doubling the latent buys reconstruction (0.462 -> 0.573) and nothing for generation (0.120 -> 0.118):
+generation sits exactly at the ceiling of the representation it is built on (nearest training
+spectrum, 0.114), and the char-LSTM on the same bins scores 0.115. The raw peak vector is a weaker
+substrate than the DreaMS embedding - its ceiling is 0.114 against 0.188 - so a generative decoder
+fitted on top of it cannot reach what the frozen features already support.
+
+The honest reading: the limit is the substrate, not the decoder. Generation tracks the retrieval
+ceiling of whatever features it is built on, and neither a wider latent nor a spectrum-reconstruction
+objective breaks through it. If generation is the goal, the encoder has to be trained on a
+structure-conditioned objective - predict the spectrum from the structure - rather than a decoder
+being fitted onto a discriminative one.
 
 ## Aligning the spectrum space with a molecule tower
 
