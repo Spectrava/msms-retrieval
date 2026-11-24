@@ -63,7 +63,11 @@ def main() -> None:
                 "max_peaks": args.max_peaks, "model": model.state_dict()}, args.out)
 
     with torch.no_grad():
-        lat_train, lat_val = model.latent(tokens[train_rows]), model.latent(tokens[val_rows])
+        # the attention matrix for the whole fold at once does not fit on the GPU
+        lat_train = torch.cat([model.latent(tokens[train_rows[i:i + 2048]])
+                               for i in range(0, len(train_rows), 2048)])
+        lat_val = torch.cat([model.latent(tokens[val_rows[i:i + 2048]])
+                             for i in range(0, len(val_rows), 2048)])
     print(f"nearest-neighbour ceiling, peak-sequence latent: "
           f"{nearest_neighbour_tanimoto(lat_train, lat_val, train_fp, val_fp):.3f}")
 

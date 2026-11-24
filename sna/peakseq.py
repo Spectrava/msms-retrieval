@@ -84,9 +84,12 @@ class PeakEncoder(nn.Module):
         return torch.where(real & pick, torch.zeros_like(tokens), tokens)
 
     def jepa_loss(self, tokens: torch.Tensor, fraction: float = 0.25,
-                  spread_weight: float = 0.1) -> torch.Tensor:
+                  spread_weight: float = 1.0) -> torch.Tensor:
+        """The penalty is the mean cosine between different latents: unlike `1 - spread` it is not
+        capped, so collapsing every spectrum onto one vector costs the full weight, not 0.1."""
         pred = F.normalize(self.predictor(self.latent(self.drop_peaks(tokens, fraction))), dim=-1)
         target = F.normalize(self.teacher(self.pooled(tokens)), dim=-1)
         error = 1 - (pred * target).sum(-1)
-        spread = (1 - pred @ pred.T).mean()
-        return error.mean() + spread_weight * (1 - spread)
+        n = len(pred)
+        collapse = 0.0 if n < 2 else ((pred @ pred.T).sum() - n) / (n * (n - 1))
+        return error.mean() + spread_weight * collapse
