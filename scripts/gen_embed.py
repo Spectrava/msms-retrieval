@@ -21,24 +21,13 @@ from rdkit.Chem import rdMolDescriptors
 
 RDLogger.DisableLog("rdApp.error")  # generated SMILES often fail to parse; the errors are noise
 
-from sna.align import canonical, smiles_tanimoto
+from sna.align import canonical, fingerprints, nearest_neighbour_tanimoto
 from sna.data import read_msg_tsv
 from sna.generate import SmilesGenerator
-from sna.genembed import GenerativeEmbedding, char_tensor, peak_matrix, train_generative
+from sna.genembed import (GenerativeEmbedding, char_tensor, generate, peak_matrix, report,
+                          train_generative)
 
 PROTON, SODIUM = 1.00728, 22.98922  # [M+H]+ and [M+Na]+ over a neutral monoisotopic mass
-
-
-def report(generated: list[str], truth: list[str]) -> tuple[float, float, float]:
-    parsed = [(canonical(g), t) for g, t in zip(generated, truth) if canonical(g)]
-    return (len(parsed) / len(generated),
-            float(np.mean([smiles_tanimoto(g, t) for g, t in parsed])) if parsed else 0.0,
-            float(np.mean([g == t for g, t in parsed])) if parsed else 0.0)
-
-
-def generate(model, z: torch.Tensor, batch: int = 512, max_len: int = 160, temperature: float = 0.0) -> list[str]:
-    return [s for i in range(0, len(z), batch)
-            for s in model.generate(z[i:i + batch], max_len, temperature)]
 
 
 def chunked_loss(model, z: torch.Tensor, chars: torch.Tensor, batch: int = 512,
@@ -52,18 +41,6 @@ def chunked_loss(model, z: torch.Tensor, chars: torch.Tensor, batch: int = 512,
 def mass_consistent(smiles: list[str], precursor: np.ndarray) -> list[bool]:
     neutral = [rdMolDescriptors.CalcExactMolWt(m) if m else 0.0 for m in map(Chem.MolFromSmiles, smiles)]
     return [abs(m + PROTON - p) < 0.05 or abs(m + SODIUM - p) < 0.05 for m, p in zip(neutral, precursor)]
-
-
-def retrieval_ceiling(z_train: torch.Tensor, z_val: torch.Tensor, train_smiles: list[str],
-                      val_smiles: list[str], sample: int = 2000) -> float:
-    """Tanimoto of the true val molecule to the molecule of its nearest training spectrum."""
-    rng = np.random.default_rng(0)
-    idx = rng.choice(len(val_smiles), sample)
-    sims = []
-    for i in idx:
-        best = int((z_train @ z_val[i]).argmax())
-        sims.append(smiles_tanimoto(train_smiles[best], val_smiles[i]))
-    return float(np.mean(sims))
 
 
 def main() -> None:
@@ -133,7 +110,8 @@ def main() -> None:
         wrong = z_val[np.random.default_rng(1).permutation(len(z_val))]
         parse, sim, exact = report(generate(model, wrong), val_smiles)
         print(f"generation, wrong spectrum         {parse:.1%} parse, {sim:.3f} Tanimoto, {exact:.1%} exact")
-        print(f"retrieval ceiling (nearest train spectrum) {retrieval_ceiling(z_train, z_val, train_smiles, val_smiles):.3f} Tanimoto")
+        print(f"retrieval ceiling (nearest train spectrum) "
+              f"{nearest_neighbour_tanimoto(z_train, z_val, fingerprints(train_smiles), fingerprints(val_smiles)):.3f} Tanimoto")
 
     if not args.load or args.baseline:
         baseline = SmilesGenerator(z_train.shape[1], vocab).cuda()
