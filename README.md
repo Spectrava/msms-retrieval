@@ -294,6 +294,12 @@ so this is not underfitting. No latent, discriminative or generative, holds the 
 linear map can read; the decoder's 0.171 is the first thing in the pipeline that does better than a
 linear probe.
 
+Replacing the ridge with a 512-hidden readout (`--mlp`) changes nothing that matters: DreaMS moves
+from 0.183 to 0.188 fingerprint and 0.161 to 0.178 ceiling, the other three stay within 0.006 of
+their linear scores and none beats the 0.112 random floor. The chemistry is not in these
+embeddings in a form any readout can reach, so the encoder - not the decoder - is the thing to
+change.
+
 ### Decoder capacity is not the bottleneck
 
 Repeating the DreaMS arm with a 512-hidden, six-layer decoder (10 epochs) gives 51.8% parse and
