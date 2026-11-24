@@ -38,6 +38,16 @@ def tanimoto(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.divide((a & b).sum(1), union, out=np.zeros(len(a), dtype=np.float64), where=union > 0)
 
 
+def nearest_neighbour_tanimoto(z_train, z_val, train_fp: np.ndarray, val_fp: np.ndarray,
+                               sample: int = 2000) -> float:
+    """Tanimoto between each val molecule and the molecule of its nearest training spectrum - the
+    score a generator can at best match by copying a neighbour. Cosine on the latents."""
+    rng = np.random.default_rng(0)
+    idx = rng.choice(len(val_fp), min(sample, len(val_fp)))
+    best = (z_train @ z_val[idx].T).argmax(0)
+    return float(tanimoto(train_fp[best], val_fp[idx]).mean())
+
+
 def smiles_tanimoto(a: str, b: str) -> float:
     """Morgan Tanimoto between two SMILES strings; 0.0 if either fails to parse."""
     ma, mb = Chem.MolFromSmiles(a), Chem.MolFromSmiles(b)
