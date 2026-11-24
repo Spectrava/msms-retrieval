@@ -79,6 +79,8 @@ def main() -> None:
     parser.add_argument("--from-peaks", action="store_true",
                         help="train the encoder on the binned peak spectrum instead of the frozen DreaMS embedding")
     parser.add_argument("--load", help="skip training and evaluate a saved checkpoint instead")
+    parser.add_argument("--baseline", action="store_true",
+                        help="also train the char-LSTM on the raw input, even when --load is given")
     parser.add_argument("--candidates", type=int, default=1,
                         help="sample this many SMILES per export spectrum (greedy first, then temperature 1.0)")
     parser.add_argument("--out", default="data/generative_embedding.pt")
@@ -133,42 +135,43 @@ def main() -> None:
         print(f"generation, wrong spectrum         {parse:.1%} parse, {sim:.3f} Tanimoto, {exact:.1%} exact")
         print(f"retrieval ceiling (nearest train spectrum) {retrieval_ceiling(z_train, z_val, train_smiles, val_smiles):.3f} Tanimoto")
 
-        if not args.load:
-            baseline = SmilesGenerator(z_train.shape[1], vocab).cuda()
-            chars = char_tensor(train_smiles, vocab, 160)
-            opt = torch.optim.Adam(baseline.parameters(), 1e-3)
-            for epoch in range(args.epochs):
-                order = torch.randperm(len(z_train), device="cuda")
-                loss = 0.0
-                for i in range(0, len(order), args.batch):
-                    r = order[i:i + args.batch]
-                    obj = baseline.loss(z_train[r], chars[r])
-                    opt.zero_grad(); obj.backward(); opt.step()
-                    loss += obj.item() * len(r)
-                print(f"[baseline] epoch {epoch} next-character loss {loss / len(z_train):.3f}", flush=True)
-            baseline.eval()
+    if not args.load or args.baseline:
+        baseline = SmilesGenerator(z_train.shape[1], vocab).cuda()
+        chars = char_tensor(train_smiles, vocab, 160)
+        opt = torch.optim.Adam(baseline.parameters(), 1e-3)
+        for epoch in range(args.epochs):
+            order = torch.randperm(len(z_train), device="cuda")
+            loss = 0.0
+            for i in range(0, len(order), args.batch):
+                r = order[i:i + args.batch]
+                obj = baseline.loss(z_train[r], chars[r])
+                opt.zero_grad(); obj.backward(); opt.step()
+                loss += obj.item() * len(r)
+            print(f"[baseline] epoch {epoch} next-character loss {loss / len(z_train):.3f}", flush=True)
+        baseline.eval()
+        with torch.no_grad():
             parse, sim, exact = report(generate(baseline, z_val), val_smiles)
-            print(f"baseline (raw embedding, no latent) {parse:.1%} parse, {sim:.3f} Tanimoto, {exact:.1%} exact")
+        print(f"baseline (raw input, no latent) {parse:.1%} parse, {sim:.3f} Tanimoto, {exact:.1%} exact")
 
-        if not args.from_peaks:  # the 7600 export stores DreaMS embeddings, not peak lists
-            export = pd.read_parquet(args.export)
-            z_export = torch.tensor(np.array(export["embedding"].tolist(), dtype=np.float32), device="cuda")
-            precursor = np.array(export["precursor_mz"], dtype=np.float64)
-            stem = args.out.rsplit(".", 1)[0]
-            rows = []
-            for k in range(args.candidates):
-                gen = generate(model, z_export, temperature=0.0 if k == 0 else 1.0)
-                rows.append(pd.DataFrame({"candidate_id": export["candidate_id"], "precursor_mz": export["precursor_mz"],
-                                          "generated_smiles": gen,
-                                          "mass_matches_precursor": mass_consistent(gen, precursor)}))
-            table = pd.concat(rows)
-            print(f"{args.export}: {int(table.generated_smiles.map(canonical).notna().sum())} of {len(table)} proposals parse, "
-                  f"{int(table.groupby('candidate_id').mass_matches_precursor.any().sum())} of {len(export)} spectra have "
-                  f"at least one proposal whose mass fits the precursor")
-            table.to_parquet(f"{stem}_generated.parquet")
-            pd.DataFrame({"candidate_id": export["candidate_id"],
-                          "generative_latent": [list(l) for l in model.latent(z_export).cpu().numpy()]}).to_parquet(
-                f"{stem}_latents.parquet")
+    if not args.from_peaks:  # the 7600 export stores DreaMS embeddings, not peak lists
+        export = pd.read_parquet(args.export)
+        z_export = torch.tensor(np.array(export["embedding"].tolist(), dtype=np.float32), device="cuda")
+        precursor = np.array(export["precursor_mz"], dtype=np.float64)
+        stem = args.out.rsplit(".", 1)[0]
+        rows = []
+        for k in range(args.candidates):
+            gen = generate(model, z_export, temperature=0.0 if k == 0 else 1.0)
+            rows.append(pd.DataFrame({"candidate_id": export["candidate_id"], "precursor_mz": export["precursor_mz"],
+                                      "generated_smiles": gen,
+                                      "mass_matches_precursor": mass_consistent(gen, precursor)}))
+        table = pd.concat(rows)
+        print(f"{args.export}: {int(table.generated_smiles.map(canonical).notna().sum())} of {len(table)} proposals parse, "
+              f"{int(table.groupby('candidate_id').mass_matches_precursor.any().sum())} of {len(export)} spectra have "
+              f"at least one proposal whose mass fits the precursor")
+        table.to_parquet(f"{stem}_generated.parquet")
+        pd.DataFrame({"candidate_id": export["candidate_id"],
+                      "generative_latent": [list(l) for l in model.latent(z_export).cpu().numpy()]}).to_parquet(
+            f"{stem}_latents.parquet")
 
 
 if __name__ == "__main__":
