@@ -44,8 +44,20 @@ def nearest_neighbour_tanimoto(z_train, z_val, train_fp: np.ndarray, val_fp: np.
     score a generator can at best match by copying a neighbour. Cosine on the latents."""
     rng = np.random.default_rng(0)
     idx = rng.choice(len(val_fp), min(sample, len(val_fp)))
-    best = (z_train @ z_val[idx].T).argmax(0)
+    best = (z_train @ z_val[idx].T).argmax(0).tolist()
     return float(tanimoto(train_fp[best], val_fp[idx]).mean())
+
+
+def readout_ceiling(pred_fp: np.ndarray, train_fp: np.ndarray, val_fp: np.ndarray, chunk: int = 2000) -> float:
+    """Tanimoto between the true molecule and the molecule of the training spectrum whose *predicted*
+    fingerprint is closest - what a lookup on a readout could reach."""
+    index = train_fp / (np.linalg.norm(train_fp, axis=1, keepdims=True) + 1e-9)
+    query = pred_fp / (np.linalg.norm(pred_fp, axis=1, keepdims=True) + 1e-9)
+    sims = np.empty(len(query), dtype=np.float64)
+    for i in range(0, len(query), chunk):
+        best = (index @ query[i:i + chunk].T).argmax(0)
+        sims[i:i + chunk] = tanimoto(train_fp[best], val_fp[i:i + chunk])
+    return float(sims.mean())
 
 
 def smiles_tanimoto(a: str, b: str) -> float:

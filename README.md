@@ -276,6 +276,31 @@ parse. The shuffled-latent column is the chemistry-prior floor: a decoder given 
 still writes a plausible structure, and anything within ~0.03 of it is not information from the
 spectrum.
 
+### How much chemistry a latent actually carries
+
+`scripts/latent_audit.py` skips the decoder entirely: a ridge map from each latent to the element
+counts and the 2048-bit Morgan fingerprint of the matching molecule, scored on held-out spectra.
+
+| substrate | formula exact | heavy atoms MAE | readout fingerprint | readout ceiling |
+|---|---|---|---|---|
+| raw 1000 bins | 0.0% | 33.6 | 0.002 | 0.126 |
+| JEPA latent | 0.0% | 13.6 | 0.113 | 0.108 |
+| autoencoder latent | 0.0% | 11.7 | 0.133 | 0.123 |
+| DreaMS embedding | 0.0% | 5.3 | 0.183 | 0.161 |
+
+A random pair of molecules in this set scores 0.112, so a linear readout recovers barely more than
+chance - and the raw bins recover less than chance. λ from 1 to 10,000 changes the number by 0.003,
+so this is not underfitting. No latent, discriminative or generative, holds the molecule in a form a
+linear map can read; the decoder's 0.171 is the first thing in the pipeline that does better than a
+linear probe.
+
+### Decoder capacity is not the bottleneck
+
+Repeating the DreaMS arm with a 512-hidden, six-layer decoder (10 epochs) gives 51.8% parse and
+0.167 Tanimoto against the 256-hidden, four-layer decoder's 62.3% and 0.171 - the bigger model is
+slightly worse, and both sit under the 0.188 ceiling. Training more parameters on the same substrate
+buys nothing; the substrate is the limit.
+
 ## Aligning the spectrum space with a molecule tower
 
 `scripts/align_spaces.py` fits a map from the DreaMS embedding to the pooled embedding of the

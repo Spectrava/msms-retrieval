@@ -3,7 +3,7 @@ rotation of the query space cannot change which indexed molecule is nearest, and
 Tanimoto agrees with the bit-matrix one."""
 import numpy as np
 
-from sna.align import fit_contrastive, nearest, ridge, smiles_tanimoto, tanimoto
+from sna.align import fit_contrastive, nearest, readout_ceiling, ridge, smiles_tanimoto, tanimoto
 
 
 def test_ridge_recovers_a_linear_map():
@@ -46,6 +46,13 @@ def test_contrastive_heads_learn_an_isometry():
     spectrum, molecule = fit_contrastive(z, m, hidden=128, out=32, epochs=10, batch=200)
     sims = molecule(m) @ spectrum(z).T
     assert (sims.argmax(0) == np.arange(400)).mean() > 0.9
+
+
+def test_readout_ceiling_is_exact_when_the_readout_is_exact():
+    """If the predicted fingerprints are the true ones, the lookup recovers the molecule."""
+    fp = np.eye(3, dtype=np.uint8)
+    assert readout_ceiling(fp, fp, fp) == 1.0
+    assert readout_ceiling(np.roll(fp, 1, axis=0), fp, fp) == 0.0  # a consistently wrong readout
 
 
 def test_smiles_tanimoto_matches_the_bit_matrices():
