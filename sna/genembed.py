@@ -127,5 +127,6 @@ def train_generative(z: torch.Tensor, smiles: list[str], vocab: list[str], laten
             obj = model.loss(z[r], chars[r], spectra[r] if spectra is not None else None)
             opt.zero_grad(); obj.backward(); opt.step()
             loss += obj.item() * len(r)
-        print(f"[generative] epoch {epoch} next-character loss {loss / len(z):.3f}", flush=True)
+        label = "next-character + reconstruction" if spectra is not None else "next-character"
+        print(f"[generative] epoch {epoch} {label} loss {loss / len(z):.3f}", flush=True)
     return model.eval()

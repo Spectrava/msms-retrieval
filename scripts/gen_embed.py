@@ -5,6 +5,8 @@ back out of it. Here it is pushed through an encoder into a bottleneck latent th
 decoder is trained, jointly, to turn into a SMILES, so the latent is generative by construction. The
 comparison is the char-LSTM decoder conditioned directly on the raw 1024-d embedding, and the
 nearest-neighbour retrieval ceiling: whatever the embedding can retrieve, the generator cannot beat.
+With --from-peaks the encoder is trained on the binned peak list instead, and the latent is also
+scored on rebuilding that spectrum.
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ RDLogger.DisableLog("rdApp.error")  # generated SMILES often fail to parse; the 
 from sna.align import canonical, smiles_tanimoto
 from sna.data import read_msg_tsv
 from sna.generate import SmilesGenerator
-from sna.genembed import GenerativeEmbedding, char_tensor, train_generative
+from sna.genembed import GenerativeEmbedding, char_tensor, peak_matrix, train_generative
 
 PROTON, SODIUM = 1.00728, 22.98922  # [M+H]+ and [M+Na]+ over a neutral monoisotopic mass
 
@@ -42,7 +44,8 @@ def generate(model, z: torch.Tensor, batch: int = 512, max_len: int = 160, tempe
 def chunked_loss(model, z: torch.Tensor, chars: torch.Tensor, batch: int = 512,
                  spectrum: torch.Tensor | None = None) -> float:
     """Next-character loss, chunked: the attention matrix for a whole fold does not fit on the GPU."""
-    return float(np.mean([model.loss(z[i:i + batch], chars[i:i + batch], spectrum).item()
+    return float(np.mean([model.loss(z[i:i + batch], chars[i:i + batch],
+                                     spectrum[i:i + batch] if spectrum is not None else None).item()
                          for i in range(0, len(z), batch)]))
 
 
