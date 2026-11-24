@@ -10,6 +10,14 @@ Pretrained weights used by scripts/embed_ms2.py: the DreaMS MassSpecGym embeddin
 https://zenodo.org/records/10997887 (code MIT, weights CC-BY-4.0). The checkpoint is not
 redistributed here; it is downloaded locally and pinned by SHA-256 in each run's provenance.
 
+Frozen molecule encoders used by scripts/align_joint.py:
+  MoLFormer-XL-both-10pct, https://huggingface.co/ibm-research/MoLFormer-XL-both-10pct (apache-2.0)
+  ChemBERTa-zinc-base-v1, https://huggingface.co/seyonec/ChemBERTa-zinc-base-v1 (no licence
+    declared on the Hub page - check before any commercial use)
+  Mol-JEPA, https://huggingface.co/Flogrammer/Mol-JEPA (MIT at the pinned HEAD revision; an
+    earlier revision of the same weight file declared CC BY-NC 4.0)
+Pinned revisions, weights hashes and the licence caveat are in docs/upstream_audit.md.
+
 The upstream MIT notices are retained below. External models and datasets are
 not relicensed by this repository.
 
