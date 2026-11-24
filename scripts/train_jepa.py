@@ -56,6 +56,10 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--decoder-epochs", type=int, default=10)
+    parser.add_argument("--decoder-hidden", type=int, default=256)
+    parser.add_argument("--decoder-layers", type=int, default=4)
+    parser.add_argument("--substrates", default="all",
+                       help="comma separated: 'JEPA latent', 'raw bins', 'DreaMS embedding'")
     parser.add_argument("--out", default="data/jepa_encoder.pt")
     parser.add_argument("--decoder-out", default="data/jepa_decoder.pt")
     parser.add_argument("--latents", default="data/jepa_latents.npz")
@@ -70,30 +74,41 @@ def main() -> None:
     vocab = sorted({c for s in train_smiles for c in s if c})
     train_fp, val_fp = fingerprints(train_smiles), fingerprints(val_smiles)
 
-    peaks = torch.tensor(peak_matrix(msg["mz"], msg["intensity"], msg["offsets"]), device="cuda")
-    z_train, z_val = peaks[train_rows], peaks[val_rows]
+    substrates = ["JEPA latent", "raw bins", "DreaMS embedding"] if args.substrates == "all" \
+        else [s.strip() for s in args.substrates.split(",")]
 
-    model = train_jepa(z_train, args.epochs, args.batch, args.hidden, args.latent, args.windows, args.fraction)
-    torch.save({"latent": args.latent, "hidden": args.hidden, "model": model.state_dict()}, args.out)
+    # the peak matrix is 776 MB on the GPU; only needed if a substrate is the bins themselves
+    if "raw bins" in substrates or "JEPA latent" in substrates:
+        peaks = torch.tensor(peak_matrix(msg["mz"], msg["intensity"], msg["offsets"]), device="cuda")
+        z_train, z_val = peaks[train_rows], peaks[val_rows]
+    else:
+        z_train, z_val = None, None
 
-    with torch.no_grad():
-        lat_train, lat_val = model.latent(z_train), model.latent(z_val)
-        np.savez(args.latents, train=lat_train.cpu().numpy(), val=lat_val.cpu().numpy())
-        pred = F.normalize(model.predictor(model.encoder(mask_windows(z_val, args.windows, args.fraction))), dim=-1)
-        target = F.normalize(model.teacher(z_val), dim=-1)
-        print(f"held-out masked-latent error {float((1 - (pred * target).sum(1)).mean()):.4f}")
-        print(f"latent predicts the spectrum (linear probe) cosine {cosine(linear_probe(lat_val, z_val), z_val):.3f}")
+    if "JEPA latent" in substrates:
+        model = train_jepa(z_train, args.epochs, args.batch, args.hidden, args.latent, args.windows, args.fraction)
+        torch.save({"latent": args.latent, "hidden": args.hidden, "model": model.state_dict()}, args.out)
+        with torch.no_grad():
+            lat_train, lat_val = model.latent(z_train), model.latent(z_val)
+            np.savez(args.latents, train=lat_train.cpu().numpy(), val=lat_val.cpu().numpy())
+            pred = F.normalize(model.predictor(model.encoder(mask_windows(z_val, args.windows, args.fraction))), dim=-1)
+            target = F.normalize(model.teacher(z_val), dim=-1)
+            print(f"held-out masked-latent error {float((1 - (pred * target).sum(1)).mean()):.4f}")
+            print(f"latent predicts the spectrum (linear probe) cosine {cosine(linear_probe(lat_val, z_val), z_val):.3f}")
+    else:
+        lat = np.load(args.latents)
+        lat_train, lat_val = torch.tensor(lat["train"], device="cuda"), torch.tensor(lat["val"], device="cuda")
 
     emb = np.load(args.spectra)
     dream = torch.tensor(emb["train"], device="cuda"), torch.tensor(emb["val"], device="cuda")
-    print(f"nearest-neighbour ceiling: raw bins {nearest_neighbour_tanimoto(z_train, z_val, train_fp, val_fp):.3f}, "
-          f"JEPA latent {nearest_neighbour_tanimoto(lat_train, lat_val, train_fp, val_fp):.3f}, "
-          f"DreaMS {nearest_neighbour_tanimoto(dream[0], dream[1], train_fp, val_fp):.3f}")
 
     for name, zt, zv in [("JEPA latent", lat_train, lat_val), ("raw bins", z_train, z_val),
                          ("DreaMS embedding", dream[0], dream[1])]:
-        decoder = train_latent_decoder(zt, train_smiles, vocab, hidden=256, layers=4,
-                                       epochs=args.decoder_epochs)
+        if name not in substrates:
+            continue
+        print(f"{name}: nearest-neighbour ceiling "
+              f"{nearest_neighbour_tanimoto(zt, zv, train_fp, val_fp):.3f}")
+        decoder = train_latent_decoder(zt, train_smiles, vocab, hidden=args.decoder_hidden,
+                                       layers=args.decoder_layers, epochs=args.decoder_epochs)
         if name == "JEPA latent":
             torch.save({"latent": args.latent, "memory": decoder.memory, "vocab": vocab,
                         "decoder": decoder.state_dict()}, args.decoder_out)
