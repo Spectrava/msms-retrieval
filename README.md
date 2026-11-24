@@ -232,6 +232,50 @@ objective breaks through it. If generation is the goal, the encoder has to be tr
 structure-conditioned objective - predict the spectrum from the structure - rather than a decoder
 being fitted onto a discriminative one.
 
+## A JEPA encoder for the raw spectrum
+
+`sna/jepa.py` and `scripts/train_jepa.py` train an encoder the JEPA way: contiguous m/z windows are
+deleted from the binned spectrum, and the encoder must predict, in latent space, the latent an EMA
+teacher would have assigned to the *whole* spectrum. Nothing is reconstructed and no molecule enters
+the loss - the encoder is scored only on filling in the peaks it was not shown.
+
+```bash
+python scripts/train_jepa.py --tsv data/MassSpecGym1.5.tsv --epochs 20 --latent 256 --hidden 512
+```
+
+Held-out masked-latent error 0.092. A linear probe from the latent back to the 1000 bins reaches
+cosine 0.640 - better than the latents that were explicitly trained to reconstruct the spectrum
+(0.462 and 0.573 above) - and its nearest-neighbour ceiling is 0.130, against 0.114 for the raw bins
+and 0.188 for DreaMS.
+
+### A decoder that reads the latent as memory
+
+`sna.genembed.LatentDecoder` expands the latent into eight memory tokens that every character
+position cross-attends to, rather than handing it to the stream as a single leading token: after a
+few characters a causal decoder can predict the next character from the characters alone, so a
+one-token prefix stops mattering. Generation (greedy or sampled) is one code path shared with the
+seed-token baseline.
+
+The loss is computed only over the real characters and the stop token. Scoring the trailing padding
+too made the training loss read 0.057 while the stop position cost 11.4 and the character positions
+4.95 - the decoder had learned to emit `END` everywhere and, at inference, produced runs of `C`.
+
+Same decoder, same hyperparameters, three substrates (19,429 held-out spectra):
+
+| substrate | dim | parses | Tanimoto | wrong spectrum | ceiling |
+|---|---|---|---|---|---|
+| JEPA latent | 256 | 81.7% | 0.122 | 0.094 | 0.130 |
+| raw 1000 bins | 1000 | 82.5% | 0.122 | 0.095 | 0.114 |
+| DreaMS embedding | 1024 | 62.3% | 0.171 | 0.094 | 0.188 |
+
+Masked latent prediction does make a better latent for retrieval and for reconstructing the
+spectrum, but it does not make a better latent for writing a molecule: generation from the JEPA
+latent is indistinguishable from generation from the raw bins it was trained on, and both now sit at
+or just above their own ceiling. DreaMS still generates the closest molecules, though fewer of them
+parse. The shuffled-latent column is the chemistry-prior floor: a decoder given the wrong spectrum
+still writes a plausible structure, and anything within ~0.03 of it is not information from the
+spectrum.
+
 ## Aligning the spectrum space with a molecule tower
 
 `scripts/align_spaces.py` fits a map from the DreaMS embedding to the pooled embedding of the
