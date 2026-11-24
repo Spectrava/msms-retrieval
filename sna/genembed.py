@@ -51,6 +51,17 @@ def char_tensor(smiles: list[str], vocab: list[str], max_len: int) -> torch.Tens
                          for s in smiles], device="cuda")
 
 
+def stop_masked_target(chars: torch.Tensor, end: int) -> torch.Tensor:
+    """Keep the real characters and the first END, ignore the trailing padding.
+
+    Padding is three quarters of a padded batch, so scoring it too makes the loss look small while
+    teaching the model nothing but "emit END".
+    """
+    target = chars.clone()
+    target[(chars == end).cumsum(1) > 1] = -100
+    return target
+
+
 def _causal_mask(length: int, device) -> torch.Tensor:
     # this torch build needs an explicit mask: -inf above the diagonal keeps each token blind to
     # the characters that come after it.
@@ -141,8 +152,9 @@ class GenerativeEmbedding(nn.Module):
     def loss(self, z: torch.Tensor, chars: torch.Tensor, spectrum: torch.Tensor | None = None) -> torch.Tensor:
         """Teacher forcing: the logits at position i predict character i+1 (END after the last)."""
         x = torch.cat([self.seed(self.latent(z))[:, None, :], self.embed(chars)], dim=1)
-        target = torch.cat([chars, torch.full((len(chars), 1), self.end, device=chars.device)], dim=1)
-        loss = F.cross_entropy(self._logits(x).reshape(-1, self.end + 1), target.reshape(-1))
+        target = stop_masked_target(
+            torch.cat([chars, torch.full((len(chars), 1), self.end, device=chars.device)], dim=1), self.end)
+        loss = F.cross_entropy(self._logits(x).reshape(-1, self.end + 1), target.reshape(-1), ignore_index=-100)
         if spectrum is not None:
             loss = loss + F.mse_loss(self.reconstruct(self.latent(z)), spectrum)
         return loss
@@ -184,9 +196,10 @@ class LatentDecoder(nn.Module):
         """Teacher forcing: the stream begins with the special token and position i predicts the
         character after it; the same special id is the stop target after the last character."""
         start = self.embed(torch.full((len(chars), 1), self.end, device=chars.device))
-        target = torch.cat([chars, torch.full((len(chars), 1), self.end, device=chars.device)], dim=1)
+        target = stop_masked_target(
+            torch.cat([chars, torch.full((len(chars), 1), self.end, device=chars.device)], dim=1), self.end)
         logits = self._logits(torch.cat([start, self.embed(chars)], dim=1), self._memory(z))
-        return F.cross_entropy(logits.reshape(-1, self.end + 1), target.reshape(-1))
+        return F.cross_entropy(logits.reshape(-1, self.end + 1), target.reshape(-1), ignore_index=-100)
 
     @torch.inference_mode()
     def generate(self, z: torch.Tensor, max_len: int = 160, temperature: float = 0.0) -> list[str]:

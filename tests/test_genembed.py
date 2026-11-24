@@ -3,7 +3,14 @@ import numpy as np
 import torch
 
 from sna.align import canonical
-from sna.genembed import train_generative, train_latent_decoder
+from sna.genembed import stop_masked_target, train_generative, train_latent_decoder
+
+
+def test_only_the_stop_token_is_scored_after_the_last_character():
+    """Padding must not be scored, or the loss is dominated by teaching the model to emit END."""
+    chars = torch.tensor([[1, 2, 3, 4, 4, 4], [5, 6, 4, 4, 4, 4]])
+    expected = torch.tensor([[1, 2, 3, 4, -100, -100], [5, 6, 4, -100, -100, -100]])
+    assert torch.equal(stop_masked_target(chars, 4), expected)
 
 
 def test_latent_rebuilds_the_spectrum_it_was_given():

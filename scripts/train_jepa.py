@@ -90,20 +90,18 @@ def main() -> None:
           f"JEPA latent {nearest_neighbour_tanimoto(lat_train, lat_val, train_fp, val_fp):.3f}, "
           f"DreaMS {nearest_neighbour_tanimoto(dream[0], dream[1], train_fp, val_fp):.3f}")
 
-    decoder = train_latent_decoder(lat_train, train_smiles, vocab, hidden=256, layers=4,
-                                   epochs=args.decoder_epochs)
-    torch.save({"latent": args.latent, "memory": decoder.memory, "vocab": vocab,
-                "decoder": decoder.state_dict()}, args.decoder_out)
-    parse, sim, exact = report(generate(decoder, lat_val), val_smiles)
-    print(f"generation from a JEPA latent  {parse:.1%} parse, {sim:.3f} Tanimoto, {exact:.1%} exact")
-    wrong = lat_val[np.random.default_rng(1).permutation(len(lat_val))]
-    parse, sim, exact = report(generate(decoder, wrong), val_smiles)
-    print(f"generation from the wrong latent {parse:.1%} parse, {sim:.3f} Tanimoto, {exact:.1%} exact")
-
-    control = train_latent_decoder(z_train, train_smiles, vocab, hidden=256, layers=4,
-                                   epochs=args.decoder_epochs)
-    parse, sim, exact = report(generate(control, z_val), val_smiles)
-    print(f"same decoder on the raw bins   {parse:.1%} parse, {sim:.3f} Tanimoto, {exact:.1%} exact")
+    for name, zt, zv in [("JEPA latent", lat_train, lat_val), ("raw bins", z_train, z_val),
+                         ("DreaMS embedding", dream[0], dream[1])]:
+        decoder = train_latent_decoder(zt, train_smiles, vocab, hidden=256, layers=4,
+                                       epochs=args.decoder_epochs)
+        if name == "JEPA latent":
+            torch.save({"latent": args.latent, "memory": decoder.memory, "vocab": vocab,
+                        "decoder": decoder.state_dict()}, args.decoder_out)
+        parse, sim, exact = report(generate(decoder, zv), val_smiles)
+        print(f"generation from the {name}  {parse:.1%} parse, {sim:.3f} Tanimoto, {exact:.1%} exact")
+        wrong = zv[np.random.default_rng(1).permutation(len(zv))][:2000]
+        parse, sim, exact = report(generate(decoder, wrong), val_smiles[:2000])
+        print(f"  same decoder, shuffled {name}  {parse:.1%} parse, {sim:.3f} Tanimoto, {exact:.1%} exact")
     print(f"done in {time.time() - started:.0f}s")
 
 
