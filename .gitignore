@@ -5,3 +5,4 @@ __pycache__/
 checkpoints/
 data/
 sna.egg-info/
+results/*.log
