@@ -346,6 +346,75 @@ is fixed to 9 heavy atoms and C/N/O/F, and only 2.4% of MassSpecGym molecules ha
 
 An aligned space is therefore useful for *ranking* candidate structures, not for producing them.
 
+## Matching the two geometries, and filling in the spectra space
+
+`scripts/align_joint.py` is the joint benchmark: frozen DreaMS spectra against a frozen molecule
+tower (`--encoder moljepa|molformer|chemberta`), scored against the 25046 unique train molecules.
+
+```bash
+python scripts/align_joint.py --tsv data/MassSpecGym1.5.tsv --encoder moljepa --dims 256 --seeds 3
+python scripts/align_joint.py --encoder molformer --methods gw --gw-sub 2000 --gw-lam 0.1 --synthetic
+```
+
+### Gromov-Wasserstein: the geometries do not match
+
+CKA, CCA and Procrustes all assume the two spaces share a coordinate system. An entropic
+Gromov-Wasserstein coupling (`sna/joint.py: gw_coupling`) does not: it only asks for a
+correspondence `Pi` under which *distances inside* each space agree, so it can match a 1024-d
+spectrum latent to a 768-d molecule latent without ever naming a shared axis.
+
+On a pool of 1000 train molecules (each Sinkhorn sweep is `O(n^3)`, so the pool stays small):
+
+| coupling | GW cost | retrieval top-1 |
+|---|---|---|
+| identity (spectrum ↔ its own molecule) | 58774 | 0.145 |
+| uniform | 77394 | — |
+| GW fixed point, `lam=0.1`, from uniform/identity/random start | 71127 | 0.102 |
+| GW after annealing `lam` 1.0 → 0.01 | 39475 | — |
+
+The implementation is correct: on a synthetic control where one geometry is a relabelling of the
+other, `lam=0.1` recovers the permutation exactly (cost 22.6 against 62598 for identity). On real
+data the coupling is the finding, not the bug. Starting from uniform, identity or a random
+doubly-stochastic matrix, Sinkhorn converges to the same near-uniform coupling, whose cost is
+*worse* than simply pairing each spectrum with its own molecule. Annealing escapes that plateau and
+finds a genuinely cheaper correspondence - 39475 against 58774 - but it is still not the true
+pairing (only 0.2% of queries pick their own molecule). The true molecule pair is not the minimum
+of the GW cost between these two latent geometries, so the two frozen spaces are not isomorphic at
+the level of molecule pairs.
+
+### Rule-based synthetic spectra do not help
+
+Populating the sparse spectra space needs a generator that is independent of the encoder being
+aligned. A decoder trained on real spectra - the char-LSTM already in `data/` - makes a
+"synthetic" spectrum a function of the molecule embedding, so every alignment measured through it
+is the decoder, not chemistry. `sna/synth.py` is therefore pure rules: the `[M+H]+` precursor, one
+peak per acyclic single-bond cleavage at the fragment's monoisotopic mass plus a proton, and the
+H₂O/NH₃/CO₂/CO losses the formula can support. 44475 spectra, mean 21.5 peaks (real MassSpecGym
+spectra average ~36), generated in 14 s per 5000 molecules; 814 of 5000 molecules collide into an
+identical peak set, so isomers with the same bond-cleavage pattern are indistinguishable by rules.
+
+| | fitted on real | fitted on synthetic |
+|---|---|---|
+| CKA with the molecule space | 0.295 | 0.233 |
+| nearest train molecule (raw cosine) | 0.184 | 0.197 |
+| CCA | 0.159 | 0.110 |
+| Procrustes | 0.151 | 0.107 |
+| contrastive heads | 0.166 | 0.100 |
+
+CKA between the real and the synthetic spectrum spaces is 0.600, so they are far from
+interchangeable, and a map fitted on the rule spectra transfers badly to real held-out spectra: it
+is below the raw-cosine baseline, and the contrastive head's Spearman correlation with Tanimoto
+similarity goes *negative* (-0.054, against 0.008 for a random pairing). The one thing the rules
+do show is that the frozen DreaMS encoder reads structure out of a minimal peak list - the
+synthetic query retrieves the nearest train molecule at 0.197, above the 0.184 of real spectra and
+about half the 0.386 structure-only ceiling. That is a probe of the encoder, not a training signal.
+
+**Recommendation:** do not fine-tune on synthetic pairs. The bottleneck is not the number of
+spectra but the objective - a frozen encoder that carries chemistry in an anisotropic,
+non-isometric space. If synthetic data is added later, it has to come from a physical
+fragmentation model (Fpocket, MolGen), be validated against real spectra, and be used only as
+augmentation alongside real pairs, never as the alignment target.
+
 ## License
 
 [MIT](LICENSE). Upstream acknowledgments and license notices are in
