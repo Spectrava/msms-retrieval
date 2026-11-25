@@ -171,6 +171,33 @@ the time, so part of what it "knows" is memorisation. For the 2,736 MS2 spectra 
 proposes 1,804 parseable structures, and only 31 of them have a monoisotopic mass consistent with the
 observed precursor (±0.05, as [M+H]+ or [M+Na]+).
 
+### Pinning the mass with MS1
+
+The precursor mass is known, so `SmilesGenerator.generate_mass_constrained` beam-searches the decoder
+instead of decoding greedily. Each prefix carries the heavy-atom mass it has emitted and the free
+valence left on those atoms, so a prefix is dropped as soon as it is already heavier than the
+precursor allows, or can no longer reach it, or cannot be a SMILES at all (`((`, `--`, a ring closed
+twice, unbalanced brackets). `<end>` is always a candidate, so a beam can close when the greedy
+continuation is infeasible.
+
+```bash
+python scripts/generate_molecules.py --tsv data/MassSpecGym1.5.tsv \
+    --ckpt checkpoints/DreaMS_embedding_model_MassSpecGym.ckpt \
+    --out data/msg_generated.parquet --spectra-embeddings data/7600_ms2_embeddings.parquet \
+    --mass-constrained --beams 16
+```
+
+On the val fold this lifts the parse rate from 73.0% to 100% and the share of proposals whose exact
+mass equals the true molecule's from 0% to 17.6% - but mean Tanimoto stays at 0.138, still under the
+0.187 retrieval baseline, and only 1% of the mass-matched molecules even have the right formula. A
+monoisotopic mass pinned to ±0.05 Da admits many formulas: C32H41N5O5 (575.3108) and C25H45N5O10
+(575.3166) are 0.006 apart. Widening the beam buys more mass hits and no structure - beams 4/16/32 on
+1,024 val spectra give 8.5%/24.8%/36.1% mass matches at mean Tanimoto 0.089/0.101/0.102.
+
+For the 2,736 MS2 spectra of the 7600 export the constraint is what makes the proposals usable at all:
+986 of them are consistent with the observed precursor as [M+H]+ or [M+Na]+, against 31 from greedy
+decoding. They are still hypotheses - the mass narrows the space, it does not identify a molecule.
+
 The DreaMS embedding is discriminative: it is a good retrieval key and a weak generative one.
 Generated SMILES are hypotheses to be reviewed, never identifications.
 

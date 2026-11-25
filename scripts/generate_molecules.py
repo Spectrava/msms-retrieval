@@ -23,8 +23,10 @@ import time
 import numpy as np
 import pandas as pd
 import torch
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from rdkit.Chem import DataStructs, rdFingerprintGenerator, rdMolDescriptors
+
+RDLogger.DisableLog("rdApp.*")  # the decoder emits many invalid SMILES; per-parse errors are noise
 
 from sna.encoders.dreams import load_dreams
 from sna.generate import SmilesGenerator
@@ -46,6 +48,20 @@ def canonical(smiles: str) -> str | None:
     return Chem.MolToSmiles(mol) if mol else None
 
 
+def neutral_mass(smiles: str) -> float:
+    mol = Chem.MolFromSmiles(smiles)
+    return rdMolDescriptors.CalcExactMolWt(mol) if mol else 0.0
+
+
+def constrained(model, z, target, tol, beams, max_len, chunk=512):
+    """Beam-search in chunks so the n*beams LSTM states stay inside memory."""
+    out = []
+    for start in range(0, len(z), chunk):
+        out += model.generate_mass_constrained(z[start:start + chunk], target[start:start + chunk],
+                                              tol=tol, beams=beams, max_len=max_len)
+    return out
+
+
 MORGAN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 
 
@@ -65,6 +81,9 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--max-len", type=int, default=120)
+    ap.add_argument("--mass-constrained", action="store_true",
+                    help="beam-search the decoder under the MS1 precursor mass instead of decoding greedily")
+    ap.add_argument("--beams", type=int, default=4, help="beam width for --mass-constrained")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -140,12 +159,30 @@ def main() -> None:
     shift_sim = [tanimoto(v, t) for v, t in zip(shifted, truth) if v]
     print(f"control - embedding of a different spectrum: mean Tanimoto {np.mean(shift_sim):.3f}")
 
+    constrained_rows = {}
+    if args.mass_constrained:
+        # The MS1 precursor pins the neutral mass exactly, so on the val fold the target is the true
+        # molecule's mass: that is the ceiling of what a mass constraint can buy.
+        targets = [neutral_mass(t) for t in truth]
+        res = constrained(model, torch.tensor(z_val, device=args.device), targets, 0.05,
+                         args.beams, args.max_len)
+        valid_c = [canonical(s) for s, _, _ in res]
+        sim_c = [tanimoto(v, t) for v, t in zip(valid_c, truth) if v]
+        print(f"mass-constrained (beams {args.beams}): parse {sum(v is not None for v in valid_c) / n:.1%}, "
+              f"mass match {sum(m for _, m, _ in res) / n:.1%}, "
+              f"exact match {sum(v is not None and v == t for v, t in zip(valid_c, truth)) / n:.2%}, "
+              f"mean Tanimoto {np.mean(sim_c):.3f}")
+        constrained_rows = {"generated_mass_constrained": [s for s, _, _ in res],
+                            "mass_constrained_valid": [v is not None for v in valid_c],
+                            "mass_constrained_matched": [m for _, m, _ in res]}
+
     out = pd.DataFrame({"identifier": msg["identifier"][val], "true_smiles": smiles[val],
                         "generated": generated, "generated_canonical": valid,
                         "valid": [v is not None for v in valid],
                         "exact": [v is not None and v == t for v, t in zip(valid, truth)],
                         "tanimoto": gen_sim + [0.0] * (n - len(gen_sim)),
-                        "nn_baseline_smiles": baseline, "nn_baseline_tanimoto": nn_sim})
+                        "nn_baseline_smiles": baseline, "nn_baseline_tanimoto": nn_sim,
+                        **constrained_rows})
     out.to_parquet(args.out)
     prov = {"encoder": "DreaMS (frozen)", "decoder": "character LSTM seeded with the embedding",
             "vocab": len(vocab), "maxLen": args.max_len, "epochs": args.epochs,
@@ -173,6 +210,24 @@ def main() -> None:
         print(f"generated {len(gen)} molecule proposals for the 7600 spectra "
             f"({sum(proposals.valid):.0f} parseable, {sum(proposals.mass_matches_precursor):.0f} whose mass "
             f"matches the observed precursor) -> data/7600_generated_molecules.parquet")
+
+        if args.mass_constrained:
+            # The adduct is not recorded, so both plausible ones are tried and the matching one kept.
+            prec = np.asarray(emb["precursor_mz"], dtype=float)
+            best = {}
+            for adduct, delta in (("[M+H]+", 1.00728), ("[M+Na]+", 22.98922)):
+                for i, (smi, matched, exact) in enumerate(
+                        constrained(model, z, prec - delta, 0.05, args.beams, args.max_len)):
+                    if matched or i not in best:
+                        best[i] = (smi, matched, exact, adduct)
+            proposals["generated_mass_constrained"] = [best[i][0] for i in range(len(gen))]
+            proposals["adduct_assumed"] = [best[i][3] for i in range(len(gen))]
+            proposals["mass_matches_precursor_constrained"] = [best[i][1] for i in range(len(gen))]
+            proposals.to_parquet("data/7600_generated_molecules.parquet")
+            parseable = sum(canonical(s) is not None for s in proposals.generated_mass_constrained)
+            print(f"mass-constrained: {parseable} parseable, "
+                f"{sum(proposals.mass_matches_precursor_constrained)} match the observed precursor "
+                f"(greedy: {sum(proposals.mass_matches_precursor)})")
 
 
 if __name__ == "__main__":
