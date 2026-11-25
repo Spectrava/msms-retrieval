@@ -1,11 +1,45 @@
 """CKA is invariant to rotation and scale, Procrustes recovers a known rotation, CCA recovers a
 linear map, SIGReg is small for a Gaussian batch and large for a collapsed one, the cosine Gram
-has no diagonal, and retrieval/MRR score a constructed case correctly."""
+has no diagonal, retrieval/MRR score a constructed case correctly, and the entropic GW coupling is
+doubly stochastic and recovers a known relabelling of the same geometry."""
 import numpy as np
 import torch
 
-from sna.joint import (cca, cka, cosine_gram, fit_geometry, mean_by_group, pair_correlation, pca,
-                       procrustes, retrieval, sigreg)
+from sna.joint import (cca, cka, cosine_distance, cosine_gram, fit_geometry, gw_coupling, gw_cost,
+                       mean_by_group, pair_correlation, pca, procrustes, retrieval, retrieval_scores,
+                       sigreg, transport, unit)
+
+
+def test_gw_coupling_is_doubly_stochastic():
+    rng = np.random.default_rng(5)
+    x = rng.normal(size=(60, 6))
+    C, D = cosine_distance(x), cosine_distance(x + rng.normal(size=(60, 6)) * 0.3)
+    Pi = gw_coupling(C, D, lam=0.1, iters=20)
+    assert np.allclose(Pi.sum(1), 1.0, atol=1e-6) and np.allclose(Pi.sum(0), 1.0, atol=1e-6)
+    assert (Pi >= 0).all()
+    # the two geometries differ only by noise, so the cheapest coupling still pairs each point
+    # with itself.
+    assert Pi.diagonal().mean() > 1 / 60
+    assert gw_cost(C, D, Pi) < gw_cost(C, D, np.full((60, 60), 1 / 60))
+
+
+def test_gw_coupling_recovers_a_known_relabeling():
+    # D is C with its points relabelled: the only geometry-preserving correspondence is that
+    # permutation, and GW should find it without ever seeing the coordinates.
+    rng = np.random.default_rng(6)
+    x = rng.normal(size=(80, 12))
+    perm = rng.permutation(80)
+    C, D = cosine_distance(x), cosine_distance(x[perm])
+    Pi = gw_coupling(C, D, lam=0.01, iters=60)
+    inv = np.argsort(perm)  # point i of C is point inv[i] of D
+    assert (np.argmax(Pi, 1) == inv).all()
+    assert gw_cost(C, D, Pi) < gw_cost(C, D, np.eye(80))
+
+
+def test_transport_with_an_identity_coupling_is_plain_cosine():
+    rng = np.random.default_rng(7)
+    q, idx = rng.normal(size=(10, 4)), rng.normal(size=(5, 4))
+    assert np.allclose(transport(q, idx, np.eye(5)), unit(q) @ unit(idx).T, atol=1e-6)
 
 
 def test_replicates_pool_into_one_row_per_molecule():
@@ -74,6 +108,9 @@ def test_retrieval_and_mrr_score_a_constructed_case():
     assert score["top1"] == 1.0 and score["mrr"] == 1.0
     wrong = retrieval(np.roll(query, 1, axis=1), index, fp, fp[1:], ids, np.array(["b", "c"]))
     assert wrong["top1"] == 0.0 and abs(wrong["mrr"] - 1 / 3) < 1e-9  # the true molecule is third
+    # retrieval is retrieval_scores on the score matrix, so a non-dot-product baseline can be
+    # scored through the second one and must give the identical numbers
+    assert retrieval_scores(unit(query) @ index.T, fp, fp[1:], ids, np.array(["b", "c"])) == score
 
 
 def test_pair_correlation_is_one_when_similarity_is_the_fingerprint_similarity():

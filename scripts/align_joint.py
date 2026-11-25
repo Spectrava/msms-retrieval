@@ -3,7 +3,10 @@
 Frozen DreaMS spectrum embeddings against a frozen molecule encoder (Mol-JEPA, CC BY-NC, or
 MoLFormer XL as the commercially permissive fallback), aligned with the four baselines from
 the brief - linear CKA, regularised CCA, orthogonal Procrustes, symmetric InfoNCE heads - plus
-the geometry-preserving projector (pairing + cosine-Gram + SIGReg).
+the geometry-preserving projector (pairing + cosine-Gram + SIGReg) and an entropic
+Gromov-Wasserstein transport coupling between the two intrinsic geometries. With --synthetic a
+third modality is added: rule-based in-silico spectra of the same molecules, so the alignment can
+be fitted on synthetic pairs and tested on real held-out spectra.
 
 Everything is fitted on the train fold; the reported fold is the held-out one. Retrieval is
 scored against the *train* molecules, so the ceiling is the fingerprint similarity of the
@@ -12,6 +15,8 @@ pair) say how much of any gain is real.
 
     python scripts/align_joint.py --encoder moljepa --dims 256 --seeds 3
     python scripts/align_joint.py --encoder molformer --methods cka,cca,procrustes
+    python scripts/align_joint.py --encoder molformer --methods gw --gw-sub 2000 --gw-lam 0.1
+    python scripts/align_joint.py --encoder molformer --methods cka,cca,procrustes,infonce --synthetic
 """
 from __future__ import annotations
 
@@ -27,8 +32,8 @@ from rdkit import RDLogger
 from sna import paths
 from sna.align import canonical, fit_contrastive, fingerprints
 from sna.data import read_msg_tsv
-from sna.joint import (cca, cka, fit_geometry, mean_by_group, pair_correlation, pca, procrustes,
-                       retrieval, unit)
+from sna.joint import (cca, cka, cosine_distance, fit_geometry, gw_coupling, gw_cost, mean_by_group,
+                       pair_correlation, pca, procrustes, retrieval, retrieval_scores, transport, unit)
 from sna.towers import Tower
 
 RDLogger.DisableLog("rdApp.error")
@@ -56,6 +61,20 @@ def molecule_embeddings(encoder: str, smiles: list[str], cache: Path) -> np.ndar
     return emb
 
 
+def embed_spectra(data: dict, ckpt: str, rows=None) -> np.ndarray:
+    """Frozen DreaMS embeddings of the rows of a CSR spectra dict, in row order."""
+    from sna.encoders.dreams import load_dreams
+    from sna.spectra import SpectraTable
+    model = load_dreams(ckpt).cuda().eval()
+    table = SpectraTable(data, rows=rows, device="cuda")
+    with torch.no_grad():  # without it the autograd graph of 7 blocks per batch costs ~20 GB
+        return np.concatenate([
+            model(table.batch(torch.arange(i, min(i + 256, len(table)), device="cuda"), model.max_peaks))[0]
+            .float().cpu().numpy()
+            for i in range(0, len(table), 256)
+        ])
+
+
 def collapse_report(x: np.ndarray) -> tuple[float, float]:
     """Standard deviation and effective rank of a latent: how much of it is still there."""
     s = np.linalg.svd(x - x.mean(0), compute_uv=False)
@@ -74,7 +93,14 @@ def main() -> None:
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--seeds", type=int, default=3)
-    parser.add_argument("--methods", default="cka,cca,procrustes,infonce,geometry")
+    parser.add_argument("--methods", default="cka,cca,procrustes,infonce,geometry,gw")
+    parser.add_argument("--gw-sub", type=int, default=2000, help="molecules in the GW pool (n^3 per iteration)")
+    parser.add_argument("--gw-lam", type=float, default=0.1, help="entropic temperature of the GW coupling")
+    parser.add_argument("--gw-iters", type=int, default=30)
+    parser.add_argument("--synthetic", action="store_true",
+                        help="add rule-based in-silico spectra: fit the alignment on synthetic pairs and "
+                             "test it on real held-out spectra")
+    parser.add_argument("--dreams", default="checkpoints/DreaMS_embedding_model_MassSpecGym.ckpt")
     parser.add_argument("--out", default="results/metrics.csv")
     args = parser.parse_args()
     methods = args.methods.split(",")
@@ -92,15 +118,8 @@ def main() -> None:
     if args.fold in emb.files:
         z_held = emb[args.fold][np.where(ok[np.where(fold == args.fold)[0]])[0]]
     else:
-        from sna.encoders.dreams import load_dreams
         from sna.spectra import SpectraTable
-        encoder = load_dreams("checkpoints/DreaMS_embedding_model_MassSpecGym.ckpt").cuda().eval()
-        table = SpectraTable(msg, device="cuda")
-        z_held = np.concatenate([
-            encoder(table.batch(torch.arange(i, min(i + 512, len(held_rows)), device="cuda"), encoder.max_peaks))[0]
-            .float().cpu().numpy()
-            for i in range(0, len(held_rows), 512)
-        ])
+        z_held = embed_spectra(msg, args.dreams, held_rows)
 
     unique = sorted({smiles[i] for i in train_rows})
     mol_of_row = np.array([unique.index(smiles[i]) for i in train_rows])
@@ -117,53 +136,137 @@ def main() -> None:
     z_unique = mean_by_group(z_train, mol_of_row)
     z_train_n, m_train_n = unit(z_unique), unit(m_train)
 
+    ids_train = np.array(unique)
     rows = []
-    def record(method, mapped, index, note=""):
-        mapped = unit(np.asarray(mapped, dtype=np.float32))
-        index = unit(np.asarray(index, dtype=np.float32))
-        score = retrieval(mapped, index, fp_train, fp_held, np.array(unique), held_ids)
-        std, erank = collapse_report(mapped)
-        row = dict(encoder=args.encoder, fold=args.fold, method=method, dim=mapped.shape[1],
-                   top1=score["top1"], top5=score["top5"], top10=score["top10"], mrr=score["mrr"],
-                   spearman=pair_correlation(mapped, index, fp_train, fp_held),
-                   std=std, effective_rank=erank, note=note)
+    def record(method, query, index, fp_index, ids_index, index_held=None, note=""):
+        # Two pools: the held fold shares no molecule with the train fold, so retrieval against
+        # train measures transfer to unseen molecules, and retrieval against the fold's own
+        # molecules is the only place an exact match is possible. index_held is left empty for
+        # baselines whose query and index are the same modality, where "nearest peer" is
+        # trivially the query itself. index=None means `query` is already a (queries, index)
+        # score matrix (the precursor-mass shortcut), which has no embedding space whose collapse
+        # or rank correlation could be reported.
+        if index is None:
+            score = retrieval_scores(np.asarray(query, dtype=np.float32), fp_index, fp_held,
+                                     ids_index, held_ids)
+            std = erank = spearman = None
+            pool = len(fp_index)
+        else:
+            query = unit(np.asarray(query, dtype=np.float32))
+            index = unit(np.asarray(index, dtype=np.float32))
+            score = retrieval(query, index, fp_index, fp_held, ids_index, held_ids)
+            std, erank = collapse_report(query)
+            spearman = pair_correlation(query, index, fp_index, fp_held)
+            pool = len(index)
+        peer = retrieval(query, unit(np.asarray(index_held, dtype=np.float32)),
+                         fp_held, fp_held, held_ids, held_ids) if index_held is not None else None
+        row = dict(encoder=args.encoder, fold=args.fold, method=method,
+                   dim=1 if index is None else query.shape[1],
+                   pool=pool,
+                   top1=score["top1"], top5=score["top5"], top10=score["top10"],
+                   top1_peer=peer["top1"] if peer else None,
+                   exact_peer=peer["mrr"] if peer else None,
+                   spearman=spearman, std=std, effective_rank=erank, note=note)
         rows.append(row)
-        print(f"{method:<22} top1 {row['top1']:.3f}  top5 {row['top5']:.3f}  top10 {row['top10']:.3f}  "
-              f"MRR {row['mrr']:.3f}  rho {row['spearman']:.3f}  std {std:.3f}  erank {erank:.1f}")
+        peer_txt = "" if peer is None else f"  peer exact {row['exact_peer']:.3f}"
+        collapse = "" if std is None else f"  rho {spearman:.3f}  std {std:.3f}  erank {erank:.1f}"
+        print(f"{method:<24} pool {pool:>6}  top1 {row['top1']:.3f}  top5 {row['top5']:.3f}  "
+              f"top10 {row['top10']:.3f}{peer_txt}{collapse}")
 
     print(f"CKA(frozen spectrum space, frozen molecule space) = {cka(z_unique, m_train):.4f}")
 
     if "cca" in methods:
         W, corr = cca(z_unique.astype(np.float64), m_train.astype(np.float64), lam=1e-3)
-        print(f"CCA: top canonical correlations {corr[:5].round(3)}")
-        record("cca", z_held @ W, m_train_n)
+        print(f"CCA: top canonical correlations {corr[:5].round(3)}, "
+              f"{(corr > 0.9).sum()} of {len(corr)} above 0.9")
+        record("cca", z_held @ W, m_train_n, fp_train, ids_train, m_held)
     if "procrustes" in methods:
         mean, comp = pca(z_unique, m_train.shape[1])
-        R = procrustes((z_unique - mean) @ comp, m_train)
-        record("procrustes", ((z_held - mean) @ comp) @ R, m_train_n)
+        R = procrustes((z_unique - mean) @ comp.T, m_train)
+        record("procrustes", ((z_held - mean) @ comp.T) @ R, m_train_n, fp_train, ids_train, m_held)
     if "infonce" in methods:
         for seed in range(args.seeds):
             spectrum, molecule = fit_contrastive(z_unique, m_train, out=args.dims, seed=seed)
-            record("infonce", spectrum(z_held), molecule(m_train), f"seed {seed}")
+            record("infonce", spectrum(z_held), molecule(m_train), fp_train, ids_train,
+                   molecule(m_held), f"seed {seed}")
     if "geometry" in methods:
         for alpha, beta in ((0.0, 0.0), (args.alpha, 0.0), (0.0, args.beta), (args.alpha, args.beta)):
             for seed in range(args.seeds):
                 spectrum, molecule = fit_geometry(z_unique, m_train, out=args.dims, alpha=alpha, beta=beta,
                                                  epochs=args.epochs, seed=seed)
-                record(f"geometry a{alpha} b{beta}", spectrum(z_held), molecule(m_train), f"seed {seed}")
+                record(f"geometry a{alpha} b{beta}", spectrum(z_held), molecule(m_train), fp_train,
+                       ids_train, molecule(m_held), f"seed {seed}")
+    if "gw" in methods:
+        for seed in range(args.seeds):
+            sub = np.random.default_rng(seed).choice(len(unique), args.gw_sub, replace=False)
+            C, D = cosine_distance(z_unique[sub]), cosine_distance(m_train[sub])
+            C, D = C / C.mean(), D / D.mean()
+            Pi = gw_coupling(C, D, lam=args.gw_lam, iters=args.gw_iters)
+            n = len(sub)
+            print(f"[gw] seed {seed} pool {n}: cost {gw_cost(C, D, Pi):.1f}  "
+                  f"identity coupling {gw_cost(C, D, np.eye(n)):.1f}  "
+                  f"uniform coupling {gw_cost(C, D, np.full((n, n), 1.0 / n)):.1f}  "
+                  f"mass on the true pair {Pi.diagonal().mean() * n:.2f}x uniform")
+            record(f"gw transport lam{args.gw_lam}", transport(z_held, z_unique[sub], Pi), None,
+                   fp_train[sub], ids_train[sub], note=f"seed {seed}")
+            record("raw cosine, same pool", z_held, z_unique[sub], fp_train[sub], ids_train[sub],
+                   note="identity coupling baseline")
 
-    record("raw spectrum cosine", z_held, z_train_n, "no alignment")
-    record("molecule space ceiling", m_held, m_train, "what a perfect map could retrieve")
+    if args.synthetic:
+        # Rule-based spectra are the only synthetic source that is independent of the encoder being
+        # aligned: a decoder trained on real spectra makes the "synthetic" spectrum a function of the
+        # molecule embedding, so any alignment measured through it is the decoder, not chemistry.
+        from sna.synth import insilico_table
+        names = unique + list(held_ids)
+        cache = Path("data/synthetic_spectra.npz")
+        if cache.exists() and list(np.load(cache)["smiles"]) == names:
+            z_syn = np.load(cache)["emb"].astype(np.float32)
+        else:
+            syn = insilico_table(names)
+            t0 = time.time()
+            z_syn = embed_spectra(syn, args.dreams)
+            np.savez(cache, smiles=np.array(names), emb=z_syn)
+            print(f"[synthetic] {len(names)} rule-based spectra, mean "
+                  f"{np.diff(syn['offsets']).mean():.1f} peaks, embedded in {time.time() - t0:.0f}s")
+        z_syn_train, z_syn_held = z_syn[: len(unique)], z_syn[len(unique):]
+        print(f"CKA(rule-based synthetic space, frozen molecule space) = {cka(z_syn_train, m_train):.4f}")
+        print(f"CKA(real spectrum space, rule-based synthetic space) = {cka(z_unique, z_syn_train):.4f}")
+        record("synthetic cosine", z_syn_held, z_syn_train, fp_train, ids_train,
+               note="rule-based spectra, no alignment")
+        if "cca" in methods:
+            W_syn, corr_syn = cca(z_syn_train.astype(np.float64), m_train.astype(np.float64), lam=1e-3)
+            record("cca fit on synthetic", z_held @ W_syn, m_train_n, fp_train, ids_train, m_held,
+                   note="learned on rule-based spectra, tested on real")
+            record("cca real-fit, synthetic query", z_syn_held @ W, m_train_n, fp_train, ids_train,
+                   note="real map applied to rule-based spectra")
+        if "procrustes" in methods:
+            mean_s, comp_s = pca(z_syn_train, m_train.shape[1])
+            R_syn = procrustes((z_syn_train - mean_s) @ comp_s.T, m_train)
+            record("procrustes fit on synthetic", ((z_held - mean_s) @ comp_s.T) @ R_syn, m_train_n,
+                   fp_train, ids_train, m_held, note="learned on rule-based spectra, tested on real")
+        if "infonce" in methods:
+            for seed in range(args.seeds):
+                spectrum, molecule = fit_contrastive(z_syn_train, m_train, out=args.dims, seed=seed)
+                record("infonce fit on synthetic", spectrum(z_held), molecule(m_train), fp_train,
+                       ids_train, molecule(m_held), f"seed {seed}")
+
+    record("raw spectrum cosine", z_held, z_train_n, fp_train, ids_train, note="no alignment")
+    record("molecule space ceiling", m_held, m_train_n, fp_train, ids_train,
+           note="what a perfect map could retrieve")
     mass = np.bincount(mol_of_row, weights=msg["precursor_mz"][train_rows]) / np.bincount(mol_of_row)
-    record("precursor mass only", -np.abs(mass[None, :] - msg["precursor_mz"][held_rows][:, None]),
-           np.ones((len(unique), 1)), "shortcut baseline")
-    record("random", np.random.default_rng(0).random((len(z_held), 8)),
-           np.random.default_rng(1).random((len(unique), 8)), "floor")
+    mz_held = msg["precursor_mz"][held_rows]
+    # |mass difference| is not a dot product, so it is passed as a score matrix; there is no
+    # embedding space here, hence no peer pool and no collapse report.
+    record("precursor mass only", -np.abs(mass[None, :] - mz_held[:, None]), None,
+           fp_train, ids_train, note="shortcut baseline")
+    rng = np.random.default_rng(0)
+    record("random", rng.random((len(z_held), 8)), rng.random((len(unique), 8)), fp_train, ids_train,
+           rng.random((len(held_ids), 8)), "floor")
 
     df = pd.DataFrame(rows)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.out, index=False)
-    print(df.groupby("method")[["top1", "top5", "top10", "mrr", "spearman"]].mean().round(3).to_string())
+    print(df.groupby("method")[["top1", "top5", "top10", "top1_peer", "exact_peer", "spearman"]].mean().round(3).to_string())
     print(f"wrote {args.out} in {time.time() - started:.0f}s")
 
 
