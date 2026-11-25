@@ -361,26 +361,37 @@ python scripts/align_joint.py --encoder molformer --methods gw --gw-sub 2000 --g
 CKA, CCA and Procrustes all assume the two spaces share a coordinate system. An entropic
 Gromov-Wasserstein coupling (`sna/joint.py: gw_coupling`) does not: it only asks for a
 correspondence `Pi` under which *distances inside* each space agree, so it can match a 1024-d
-spectrum latent to a 768-d molecule latent without ever naming a shared axis.
+spectrum latent to a 512-d molecule latent without ever naming a shared axis.
 
-On a pool of 1000 train molecules (each Sinkhorn sweep is `O(n^3)`, so the pool stays small):
+Mol-JEPA, pool 2000 train molecules, 3 seeds (each Sinkhorn sweep is `O(n^3)`, so the pool stays
+small):
 
-| coupling | GW cost | retrieval top-1 |
+| coupling | GW cost (seeds 0/1/2) | retrieval top-1 |
 |---|---|---|
-| identity (spectrum ↔ its own molecule) | 58774 | 0.145 |
-| uniform | 77394 | — |
-| GW fixed point, `lam=0.1`, from uniform/identity/random start | 71127 | 0.102 |
-| GW after annealing `lam` 1.0 → 0.01 | 39475 | — |
+| identity (spectrum ↔ its own molecule) | 221971 / 221414 / 224808 | 0.152 / 0.162 / 0.158 |
+| uniform | 273635 / 269131 / 268396 | — |
+| GW fixed point, `lam=0.1` | 249070 / 241077 / 241434 | 0.082 / 0.082 / 0.094 |
+
+The coupling puts **less** mass on the true molecule pair than chance does (0.87-0.91x uniform),
+and transporting through it retrieves worse than plain cosine in the same pool (0.086 against
+0.157). With MoLFormer XL on a pool of 1000 the same pattern holds: identity 58774, uniform
+77394, GW fixed point 71127 - the optimum is *worse* than pairing each spectrum with its own
+molecule, from uniform, identity and random warm starts alike.
 
 The implementation is correct: on a synthetic control where one geometry is a relabelling of the
 other, `lam=0.1` recovers the permutation exactly (cost 22.6 against 62598 for identity). On real
-data the coupling is the finding, not the bug. Starting from uniform, identity or a random
-doubly-stochastic matrix, Sinkhorn converges to the same near-uniform coupling, whose cost is
-*worse* than simply pairing each spectrum with its own molecule. Annealing escapes that plateau and
-finds a genuinely cheaper correspondence - 39475 against 58774 - but it is still not the true
-pairing (only 0.2% of queries pick their own molecule). The true molecule pair is not the minimum
-of the GW cost between these two latent geometries, so the two frozen spaces are not isomorphic at
+data the coupling is the finding, not the bug. Annealing `lam` 1.0 -> 0.01 does escape the plateau
+and finds a genuinely cheaper correspondence (39475 against 58774), but it is still not the true
+pairing (0.2% of queries pick their own molecule). The true molecule pair is not the minimum of
+the GW cost between these two latent geometries, so the two frozen spaces are not isomorphic at
 the level of molecule pairs.
+
+The geometry-preserving projector is the one fitted map that does order pairs better: pairing plus
+the cosine-Gram term plus SIGReg gives a Spearman of 0.263 between latent proximity and Tanimoto
+similarity, against 0.142 for raw cosine - and pairing alone, without the geometry term, gives
+-0.059. It buys that ordering by throwing most of the space away (effective rank 56 against 676),
+and better ordering still does not translate into retrieval (0.148 top-1 against 0.184): the gain is
+in the middle of the ranking, not at the top.
 
 ### Rule-based synthetic spectra do not help
 
@@ -393,7 +404,7 @@ H₂O/NH₃/CO₂/CO losses the formula can support. 44475 spectra, mean 21.5 pe
 spectra average ~36), generated in 14 s per 5000 molecules; 814 of 5000 molecules collide into an
 identical peak set, so isomers with the same bond-cleavage pattern are indistinguishable by rules.
 
-| | fitted on real | fitted on synthetic |
+| | fitted on real (MoLFormer XL) | fitted on synthetic |
 |---|---|---|
 | CKA with the molecule space | 0.295 | 0.233 |
 | nearest train molecule (raw cosine) | 0.184 | 0.197 |
