@@ -56,14 +56,28 @@ def test_hard_gw_recovers_a_known_relabeling():
     assert gw_cost(C, D, Pi) < gw_cost(C, D, np.eye(120))
 
 
-def test_annealing_reaches_a_no_colder_schedule_than_a_cold_start():
-    # The same temperature at the end of both runs; the one that started soft and cooled has had
-    # more room to search, so it cannot be worse than the one dropped straight into the hard regime.
+def test_annealing_is_a_schedule_and_a_flat_one_is_a_no_op():
+    # On a control where an isometry exists, cooling from a soft start should not end in a worse
+    # basin than dropping straight into the hard one. On the real data it does not, and that is the
+    # point of running both.
     C, D, _ = _relabelled_geometries(150, 20, seed=11, noise=0.5)
     cold = gw_coupling(C, D, lam=0.01, iters=30)
     annealed = gw_coupling(C, D, lam=0.01, iters=30, anneal_from=1.0)
     assert gw_cost(C, D, annealed) <= gw_cost(C, D, cold)
-    assert np.allclose(gw_coupling(C, D, lam=0.01, iters=30, anneal_from=0.01), cold)  # flat schedule
+    assert np.allclose(gw_coupling(C, D, lam=0.01, iters=30, anneal_from=0.01), cold)
+
+
+def test_entropic_gw_finds_a_correspondence_when_one_exists():
+    # The capability control behind --gw-control: a geometry against a noisy copy of itself. If the
+    # solver cannot recover a pairing that is there, a failure on real data says nothing about the
+    # data. The hard assignment cannot, which is why it is a diagnostic and not a competitor.
+    rng = np.random.default_rng(3)
+    x = rng.normal(size=(200, 30))
+    C = cosine_distance(x); C /= C.mean()
+    D = cosine_distance(x + rng.normal(size=(200, 30)) * 0.1); D /= D.mean()
+    Pi = gw_coupling(C, D, lam=0.01, iters=30)
+    assert (Pi.argmax(1) == np.arange(200)).mean() > 0.9
+    assert gw_diagnostics(C, D, Pi)["true_pair_mass"] > 100
 
 
 def test_couplings_are_equivariant_under_a_joint_relabeling():
@@ -76,6 +90,12 @@ def test_couplings_are_equivariant_under_a_joint_relabeling():
         Pi, Pi2 = fit(C, D), fit(C, D2)
         assert np.allclose(Pi2, Pi[:, q], atol=1e-6)
         assert abs(gw_cost(C, D2, Pi2) - gw_cost(C, D, Pi)) < 1e-6
+
+
+def test_gw_cost_is_symmetric_in_the_two_geometries():
+    C, D, _ = _relabelled_geometries(60, 8, seed=3)
+    Pi = gw_coupling(C, D, lam=0.1, iters=20)
+    assert abs(gw_cost(C, D, Pi) - gw_cost(D, C, Pi.T)) < 1e-9
 
 
 def test_gw_diagnostics_are_relative_to_no_pairing_at_all():

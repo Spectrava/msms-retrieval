@@ -104,9 +104,10 @@ def gw_coupling(C: np.ndarray, D: np.ndarray, lam: float = 0.1, iters: int = 30,
     lam=0.1 is close to a hard assignment.
 
     anneal_from starts the schedule at that lam and reaches `lam` geometrically over `iters`
-    iterations. A hard assignment reached directly from the uniform coupling gets stuck in the
-    basin it started in; annealing lets the coupling settle before the temperature forces a
-    decision, so the annealed run is the one to compare against, not the fixed-lam run.
+    iterations. Sinkhorn from the uniform coupling at a small lam converges to whichever basin the
+    temperature first freezes it in; cooling from a soft start lets the coupling settle before the
+    temperature forces a decision. That explores a different basin, not necessarily a cheaper one -
+    compare the two costs, do not assume the annealed run wins.
 
     shortcut: each iteration is an n^3 matmul, so the pool has to stay in the low thousands;
     upgrade to a low-rank or block GW if a larger pool is ever needed.

@@ -363,28 +363,69 @@ Gromov-Wasserstein coupling (`sna/joint.py: gw_coupling`) does not: it only asks
 correspondence `Pi` under which *distances inside* each space agree, so it can match a 1024-d
 spectrum latent to a 512-d molecule latent without ever naming a shared axis.
 
-Mol-JEPA, pool 2000 train molecules, 3 seeds (each Sinkhorn sweep is `O(n^3)`, so the pool stays
-small):
+Mol-JEPA, pool 2000 train molecules, held-out test fold, `lam=0.01`, 2 seeds (each Sinkhorn sweep
+is `O(n^3)`, so the pool stays small):
 
-| coupling | GW cost (seeds 0/1/2) | retrieval top-1 |
-|---|---|---|
-| identity (spectrum ↔ its own molecule) | 221971 / 221414 / 224808 | 0.152 / 0.162 / 0.158 |
-| uniform | 273635 / 269131 / 268396 | — |
-| GW fixed point, `lam=0.1` | 249070 / 241077 / 241434 | 0.082 / 0.082 / 0.094 |
+```bash
+python scripts/align_joint.py --tsv data/MassSpecGym1.5.tsv --encoder moljepa --fold test \
+  --methods gw --gw-sub 2000 --gw-lam 0.01 --gw-anneal 1.0 --gw-method entropic,hard --seeds 2
+```
 
-The coupling puts **less** mass on the true molecule pair than chance does (0.87-0.91x uniform),
-and transporting through it retrieves worse than plain cosine in the same pool (0.086 against
-0.157). With MoLFormer XL on a pool of 1000 the same pattern holds: identity 58774, uniform
-77394, GW fixed point 71127 - the optimum is *worse* than pairing each spectrum with its own
-molecule, from uniform, identity and random warm starts alike.
+| coupling | GW cost (seed 0 / seed 1) | mass on the true pair | top-1 of the coupling | retrieval top-1 |
+|---|---|---|---|---|
+| identity (spectrum ↔ its own molecule) | 221971 / 221414 | 1.00x uniform | 1.000 | 0.154 / 0.159 |
+| uniform | 273635 / 269131 | 1.00x uniform | — | — |
+| entropic, `lam=0.01` | 132365 / 124447 | 0.58x / 0.23x | 0.000 / 0.001 | 0.084 / 0.087 |
+| annealed 1.0 → 0.01 | 132309 / 127336 | 0.27x / 0.26x | 0.000 / 0.000 | 0.082 / 0.090 |
+| hard (Hungarian, no temperature) | 202156 / 193653 | 2 / 3 fixed points | 0.001 / 0.002 | 0.091 / 0.088 |
 
-The implementation is correct: on a synthetic control where one geometry is a relabelling of the
-other, `lam=0.1` recovers the permutation exactly (cost 22.6 against 62598 for identity). On real
-data the coupling is the finding, not the bug. Annealing `lam` 1.0 -> 0.01 does escape the plateau
-and finds a genuinely cheaper correspondence (39475 against 58774), but it is still not the true
-pairing (0.2% of queries pick their own molecule). The true molecule pair is not the minimum of
-the GW cost between these two latent geometries, so the two frozen spaces are not isomorphic at
-the level of molecule pairs.
+The minimum of the GW cost is nowhere near the true pairing: the cheapest correspondence found is
+40% cheaper than pairing each spectrum with its own molecule, and it puts *less* mass on the true
+pairs than a random pairing does. Transporting through it retrieves worse than plain cosine in the
+same pool (0.086 against 0.156).
+
+Annealing is not the escape hatch it was reported to be. Cooling `lam` from 1.0 to 0.01 helps on
+one seed (132309 against 132365) and hurts on the other (127336 against 124447): the schedule finds
+a different basin, not a better one. The hard-assignment coupling - the Hungarian algorithm on the
+linearised cross term, warm-started from uniform rather than from the identity, since the identity
+is the hypothesis being tested - is the only variant that concentrates mass (a permutation with 2
+or 3 fixed points), and it is still half again as expensive as the entropic optimum.
+
+The same battery run against geometries where the answer is known (`--gw-control`, Mol-JEPA, test
+fold, pool 1000, seed 0, `lam=0.01`) says where the method is capable and where it is not:
+
+```bash
+python scripts/align_joint.py --tsv data/MassSpecGym1.5.tsv --encoder moljepa --fold test \
+  --methods gw --gw-sub 50 --gw-lam 0.01 --gw-method entropic,hard \
+  --gw-control --gw-control-sub 1000 --seeds 1
+```
+
+| geometry pair | entropic cost | identity | uniform | mass on the true pair | coupling top-1 | hard cost | hard top-1 |
+|---|---|---|---|---|---|---|---|
+| molecule latent vs a noisy copy of itself | 20480 | 12233 | 64385 | 220.0x | 0.890 | 39089 | 0.011 |
+| molecule latent vs Tanimoto chemistry | 39965 | 40702 | 53449 | 0.68x | 0.000 | 43277 | 0.001 |
+| spectrum latent vs Tanimoto chemistry | 17581 | 19667 | 25974 | 0.84x | 0.000 | 20377 | 0.000 |
+
+Read down the first column: the coupling recovers a correspondence when one exists. Given a
+geometry and a perturbed copy of itself it puts 220x uniform mass on the right molecule and 89% of
+rows argmax to it. So the failure on the real spectrum-molecule pair is the data, not the transport.
+
+The other two rows say how much chemistry each latent carries, and that is encoder-dependent. With
+MoLFormer XL (pool 500) pairing the molecule latent with the Tanimoto geometry of its own fingerprint
+is cheaper than any coupling the solver finds (10293 against 11734) and still concentrates 2.3x on
+the true pairs; with Mol-JEPA it is not (40702 against 39965) and the coupling puts *less* mass on
+the true pairs than a random pairing does. In both encoders the spectrum latent carries less: its
+identity is within 12% of the fixed point and its true-pair mass is below chance.
+
+The controls also bound what "the GW optimum" means. The linearised Sinkhorn iteration is a local
+search, not a minimiser: on the self control its fixed point costs 67% more than the identity it
+just recovered. The hard Hungarian variant is weaker still - it recovers an exact isometry in the
+unit test but not a noisy one (top-1 0.011, cost 39089 against 12233). It is a diagnostic, not a
+competitor.
+
+So the true molecule pair is not the minimum of the GW cost between these two latent geometries:
+the frozen spectrum space and the frozen molecule space are not isomorphic at the level of
+molecule pairs.
 
 The geometry-preserving projector is the one fitted map that does order pairs better: pairing plus
 the cosine-Gram term plus SIGReg gives a Spearman of 0.263 between latent proximity and Tanimoto
@@ -419,6 +460,14 @@ similarity goes *negative* (-0.054, against 0.008 for a random pairing). The one
 do show is that the frozen DreaMS encoder reads structure out of a minimal peak list - the
 synthetic query retrieves the nearest train molecule at 0.197, above the 0.184 of real spectra and
 about half the 0.386 structure-only ceiling. That is a probe of the encoder, not a training signal.
+
+The GW coupling says the same thing from the other side (MoLFormer XL, val fold, pool 2000, seed 0,
+`lam=0.01`). Coupling the rule-based spectrum geometry to the molecule geometry costs 158457 and puts
+1.72x uniform mass on the true molecule - no better than the real-spectrum coupling (155936, 1.92x) -
+and retrieving through either gives 0.106 / 0.107 against 0.152 for plain cosine in the same pool. But
+real and rule-based spectra couple to *each other* cleanly: 126831 against an identity of 153984, with
+3.27x of the mass on the right molecule. The two spectrum spaces are close to isomorphic; neither is
+isomorphic to the molecule space. More spectra of the first kind cannot repair the second mismatch.
 
 The test fold says the same thing (Mol-JEPA, 3 seeds): raw cosine 0.185, CCA 0.153, Procrustes
 0.159, contrastive heads 0.162 (7.3% exact against the held fold's own molecules), geometry

@@ -3,7 +3,8 @@ rotation of the query space cannot change which indexed molecule is nearest, and
 Tanimoto agrees with the bit-matrix one."""
 import numpy as np
 
-from sna.align import fit_contrastive, nearest, readout_ceiling, ridge, smiles_tanimoto, tanimoto
+from sna.align import (fit_contrastive, fingerprints, nearest, readout_ceiling, ridge,
+                       smiles_tanimoto, tanimoto, tanimoto_matrix)
 
 
 def test_ridge_recovers_a_linear_map():
@@ -62,3 +63,15 @@ def test_smiles_tanimoto_matches_the_bit_matrices():
     assert smiles_tanimoto("CCO", "xyz") == 0.0  # RDKit cannot parse it
     assert 0.0 < smiles_tanimoto("CCO", "CCOC") < 1.0
     assert abs(smiles_tanimoto("CCO", "CCOC") - tanimoto(fp[:1], fp[1:2])[0]) < 1e-9
+
+
+def test_tanimoto_matrix_is_the_full_pairwise_similarity():
+    """Every entry of the matrix, not just the paired diagonal, against a per-row count."""
+    rng = np.random.default_rng(3)
+    fp = rng.integers(2, size=(12, 2048)).astype(np.uint8)
+    M = tanimoto_matrix(fp, fp)
+    for i in range(12):
+        for j in range(12):
+            union = int((fp[i] | fp[j]).sum())
+            assert abs(M[i, j] - ((fp[i] & fp[j]).sum() / union if union else 0.0)) < 1e-9
+    assert np.allclose(np.diag(M), 1.0) and np.allclose(M, M.T)

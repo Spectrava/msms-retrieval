@@ -38,6 +38,16 @@ def tanimoto(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.divide((a & b).sum(1), union, out=np.zeros(len(a), dtype=np.float64), where=union > 0)
 
 
+def tanimoto_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Full pairwise Tanimoto between two sets of 0/1 fingerprints. `tanimoto` pairs row i of a with
+    row i of b; this is the matrix. A dot product counts the shared bits, and the union is the two
+    sizes minus that, so no popcount is needed."""
+    x = a.astype(np.float32); y = b.astype(np.float32)
+    inter = (x @ y.T).astype(np.float64)
+    union = x.sum(1)[:, None].astype(np.float64) + y.sum(1)[None, :] - inter
+    return np.divide(inter, union, out=np.zeros((len(a), len(b)), dtype=np.float64), where=union > 0)
+
+
 def nearest_neighbour_tanimoto(z_train, z_val, train_fp: np.ndarray, val_fp: np.ndarray,
                                sample: int = 2000) -> float:
     """Tanimoto between each val molecule and the molecule of its nearest training spectrum - the

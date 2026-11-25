@@ -31,9 +31,9 @@ import torch
 from rdkit import RDLogger
 
 from sna import paths
-from sna.align import canonical, fit_contrastive, fingerprints
+from sna.align import canonical, fit_contrastive, fingerprints, tanimoto_matrix
 from sna.data import read_msg_tsv
-from sna.joint import (cca, cka, cosine_distance, fit_geometry, gw_coupling, gw_cost, gw_diagnostics,
+from sna.joint import (cca, cka, cosine_distance, fit_geometry, gw_coupling, gw_diagnostics,
                        hard_gw_coupling, mean_by_group, pair_correlation, pca, procrustes, retrieval,
                        retrieval_scores, transport, unit)
 from sna.towers import Tower
@@ -106,6 +106,11 @@ def main() -> None:
     parser.add_argument("--gw-anneal", type=float, default=None,
                         help="start the entropic coupling at this lam and anneal geometrically to "
                              "--gw-lam; the annealed run is the one to compare against")
+    parser.add_argument("--gw-control", action="store_true",
+                        help="run the capability controls: each geometry against a noisy copy of "
+                             "itself and against the Tanimoto geometry of the fingerprints")
+    parser.add_argument("--gw-control-sub", type=int, default=1000,
+                        help="molecules in the control pool (the controls are run per seed)")
     parser.add_argument("--synthetic", action="store_true",
                         help="add rule-based in-silico spectra: fit the alignment on synthetic pairs and "
                              "test it on real held-out spectra")
@@ -113,6 +118,7 @@ def main() -> None:
     parser.add_argument("--out", default="results/metrics.csv")
     args = parser.parse_args()
     methods = args.methods.split(",")
+    lams = [float(x) for x in str(args.gw_lam).split(",")]
     started = time.time()
 
     msg = read_msg_tsv(args.tsv)
@@ -212,7 +218,7 @@ def main() -> None:
             C, D = C / C.mean(), D / D.mean()
             n = len(sub)
             names = args.gw_method.split(",") + (["annealed"] if args.gw_anneal else [])
-            for lam in [float(x) for x in str(args.gw_lam).split(",")]:
+            for lam in lams:
                 fit = {"entropic": lambda: gw_coupling(C, D, lam, args.gw_iters),
                        "annealed": lambda: gw_coupling(C, D, lam, args.gw_iters, anneal_from=args.gw_anneal),
                        "hard": lambda: hard_gw_coupling(C, D, args.gw_iters)}
@@ -224,17 +230,27 @@ def main() -> None:
                           f"true-pair mass {d['true_pair_mass']:.2f}x uniform  top1 {d['top1']:.3f}")
                     record(f"gw {name} lam{lam}", transport(z_held, z_unique[sub], Pi), None,
                            fp_train[sub], ids_train[sub], note=f"seed {seed}")
-            # Control: hide the true pairing behind a random permutation of the molecule geometry.
-            # If the coupling recovers that permutation, it is capable of finding a correspondence
-            # in these two geometries, and failing to find the real one is a property of the data
-            # rather than of the solver.
-            q = np.random.default_rng(seed + 97).permutation(n)
-            Dq = D[np.ix_(q, q)]
-            Pi = gw_coupling(C, Dq, lam=min(float(x) for x in str(args.gw_lam).split(",")),
-                             iters=args.gw_iters)
-            print(f"[gw control ] seed {seed} pool {n}: injected pairing recovered top1 "
-                  f"{(Pi.argmax(1) == q).mean():.3f}  cost {gw_cost(C, Dq, Pi):.1f} "
-                  f"vs identity {gw_cost(C, Dq, np.eye(n)):.1f}")
+            # Control: can this solver find a correspondence at all in geometries of this size and
+            # scale? Pair each geometry with a noisy copy of itself (an isometry exists by
+            # construction) and with the Tanimoto geometry of the fingerprints - chemistry, the
+            # ground truth the latents are supposed to encode. If the true pairing is recovered
+            # there but not between the two modalities, the mismatch is the data, not the transport.
+            if args.gw_control:
+                ctl = np.random.default_rng(seed).choice(len(unique), args.gw_control_sub, replace=False)
+                A = cosine_distance(z_unique[ctl]); A /= A.mean()
+                B = cosine_distance(m_train[ctl]); B /= B.mean()
+                noise = np.random.default_rng(seed + 7).normal(size=m_train[ctl].shape) * 0.1
+                Bn = cosine_distance(m_train[ctl] + noise); Bn /= Bn.mean()
+                T = 1.0 - tanimoto_matrix(fp_train[ctl], fp_train[ctl]); T /= T.mean()
+                for name, (X, Y) in (("self", (B, Bn)), ("molecule vs chemistry", (B, T)),
+                                     ("spectrum vs chemistry", (A, T))):
+                    for fit in ("entropic", "hard"):
+                        Pi = (gw_coupling(X, Y, lam=lams[0], iters=args.gw_iters) if fit == "entropic"
+                              else hard_gw_coupling(X, Y, args.gw_iters))
+                        d = gw_diagnostics(X, Y, Pi)
+                        print(f"[gw control {name:<21} {fit:<8}] pool {len(ctl)}: cost {d['cost']:>10.1f}  "
+                              f"identity {d['cost_identity']:>10.1f}  uniform {d['cost_uniform']:>10.1f}  "
+                              f"true-pair mass {d['true_pair_mass']:.2f}x uniform  top1 {d['top1']:.3f}")
             record("raw cosine, same pool", z_held, z_unique[sub], fp_train[sub], ids_train[sub],
                    note="identity coupling baseline")
 
@@ -257,6 +273,32 @@ def main() -> None:
         z_syn_train, z_syn_held = z_syn[: len(unique)], z_syn[len(unique):]
         print(f"CKA(rule-based synthetic space, frozen molecule space) = {cka(z_syn_train, m_train):.4f}")
         print(f"CKA(real spectrum space, rule-based synthetic space) = {cka(z_unique, z_syn_train):.4f}")
+        if "gw" in methods:
+            # Does the rule-based space couple to the molecule space where the real one does not?
+            # Same pool, same seed, same temperature as the real arm, so the two costs are directly
+            # comparable; the identity coupling is the true pairing in both.
+            for seed in range(args.seeds):
+                sub = np.random.default_rng(seed).choice(len(unique), args.gw_sub, replace=False)
+                M = cosine_distance(m_train[sub]); M /= M.mean()
+                for name, Q in (("rule-based", z_syn_train[sub]), ("real spectra", z_unique[sub])):
+                    X = cosine_distance(Q); X /= X.mean()
+                    Pi = gw_coupling(X, M, lam=lams[0], iters=args.gw_iters)
+                    d = gw_diagnostics(X, M, Pi)
+                    print(f"[gw {name:<12} vs molecules] seed {seed} pool {len(sub)}: "
+                          f"cost {d['cost']:>10.1f}  identity {d['cost_identity']:>10.1f}  "
+                          f"uniform {d['cost_uniform']:>10.1f}  true-pair mass {d['true_pair_mass']:.2f}x "
+                          f"top1 {d['top1']:.3f}")
+                    record(f"gw {name} -> molecules", transport(z_syn_held, z_syn_train[sub], Pi)
+                           if name == "rule-based" else transport(z_held, z_unique[sub], Pi),
+                           None, fp_train[sub], ids_train[sub], note=f"seed {seed}")
+                A = cosine_distance(z_unique[sub]); A /= A.mean()
+                B = cosine_distance(z_syn_train[sub]); B /= B.mean()
+                Pi = gw_coupling(A, B, lam=lams[0], iters=args.gw_iters)
+                d = gw_diagnostics(A, B, Pi)
+                print(f"[gw real vs rule-based  ] seed {seed} pool {len(sub)}: "
+                      f"cost {d['cost']:>10.1f}  identity {d['cost_identity']:>10.1f}  "
+                      f"uniform {d['cost_uniform']:>10.1f}  true-pair mass {d['true_pair_mass']:.2f}x "
+                      f"top1 {d['top1']:.3f}")
         record("synthetic cosine", z_syn_held, z_syn_train, fp_train, ids_train,
                note="rule-based spectra, no alignment")
         if "cca" in methods:
