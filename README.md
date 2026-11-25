@@ -420,6 +420,10 @@ do show is that the frozen DreaMS encoder reads structure out of a minimal peak 
 synthetic query retrieves the nearest train molecule at 0.197, above the 0.184 of real spectra and
 about half the 0.386 structure-only ceiling. That is a probe of the encoder, not a training signal.
 
+The test fold says the same thing (Mol-JEPA, 3 seeds): raw cosine 0.185, CCA 0.153, Procrustes
+0.159, contrastive heads 0.162 (7.3% exact against the held fold's own molecules), geometry
+projector 0.145 with rho 0.268, structure-only ceiling 0.343, precursor mass 0.132, random 0.100.
+
 **Recommendation:** do not fine-tune on synthetic pairs. The bottleneck is not the number of
 spectra but the objective - a frozen encoder that carries chemistry in an anisotropic,
 non-isometric space. If synthetic data is added later, it has to come from a physical
