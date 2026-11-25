@@ -10,7 +10,8 @@ Four baselines of increasing ambition, all fitted on the train fold only:
                  map fit".
   GW           - an entropic Gromov-Wasserstein transport coupling between the two geometries:
                  no shared coordinates, only a correspondence that makes the distances inside
-                 each space agree.
+                 each space agree. Its annealed and hard-assignment (Hungarian) variants say
+                 whether the coupling found is a property of the temperature or of the data.
   geometry     - two trainable projectors into a shared space, optimised with a pairing term
                  plus a soft constraint that each modality keeps its own neighbourhood
                  structure (cosine Gram) and stays non-collapsed (SIGReg).
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from scipy.optimize import linear_sum_assignment
 from torch import nn
 from torch.nn import functional as F
 
@@ -85,7 +87,8 @@ def procrustes(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return (u @ vt).astype(np.float32)
 
 
-def gw_coupling(C: np.ndarray, D: np.ndarray, lam: float = 0.1, iters: int = 30) -> np.ndarray:
+def gw_coupling(C: np.ndarray, D: np.ndarray, lam: float = 0.1, iters: int = 30,
+                anneal_from: float | None = None) -> np.ndarray:
     """Entropic Gromov-Wasserstein coupling between two geometries C and D (symmetric distance
     matrices of the same size, uniform marginals).
 
@@ -100,29 +103,81 @@ def gw_coupling(C: np.ndarray, D: np.ndarray, lam: float = 0.1, iters: int = 30)
     the same thing for a pool of 100 as for a pool of 10000. lam=1 is a soft, diffuse coupling;
     lam=0.1 is close to a hard assignment.
 
+    anneal_from starts the schedule at that lam and reaches `lam` geometrically over `iters`
+    iterations. A hard assignment reached directly from the uniform coupling gets stuck in the
+    basin it started in; annealing lets the coupling settle before the temperature forces a
+    decision, so the annealed run is the one to compare against, not the fixed-lam run.
+
     shortcut: each iteration is an n^3 matmul, so the pool has to stay in the low thousands;
     upgrade to a low-rank or block GW if a larger pool is ever needed.
     """
     n = len(C)
     C, D = C.astype(np.float64), D.astype(np.float64)
     Pi = np.full((n, n), 1.0 / n)
-    for _ in range(iters):
+    for i in range(iters):
+        t = lam if anneal_from is None else anneal_from * (lam / anneal_from) ** (i / max(iters - 1, 1))
         L = C @ Pi @ D
-        # log-domain Sinkhorn: exp would underflow at small lam.
-        logPi = (L - L.mean()) / (lam * max(L.std(), 1e-12))
-        u, v = np.zeros((n, 1)), np.zeros((1, n))
-        for _ in range(1000):
-            u = -_logsumexp(logPi + v, 1)
-            v = -_logsumexp(logPi + u, 0)
-            Pi = np.exp(logPi + u + v)
-            if abs(Pi.sum(1) - 1).max() < 1e-9 and abs(Pi.sum(0) - 1).max() < 1e-9:
-                break  # Sinkhorn has converged to a doubly stochastic coupling
+        Pi = _sinkhorn((L - L.mean()) / (t * max(L.std(), 1e-12)))
+    return Pi
+
+
+def hard_gw_coupling(C: np.ndarray, D: np.ndarray, iters: int = 20) -> np.ndarray:
+    """Hard-assignment GW: alternate Hungarian assignments on the linearised cross term until the
+    permutation stops changing. No temperature, so the answer is a permutation, and the question it
+    answers is the one the entropic coupling cannot: is there *any* pairing of the pool under which
+    the two geometries agree better than the true one?
+
+    It starts from the uniform coupling, not from the identity: a hard assignment started from any
+    single permutation converges to the basin of that permutation, and the identity is exactly the
+    hypothesis we are trying to test.
+    """
+    n = len(C)
+    C, D = C.astype(np.float64), D.astype(np.float64)
+    Pi = np.full((n, n), 1.0 / n)
+    best, best_cost = None, np.inf
+    for _ in range(iters):
+        rows, cols = linear_sum_assignment(-(C @ Pi @ D))
+        Pi = np.zeros((n, n))
+        Pi[rows, cols] = 1.0
+        cost = gw_cost(C, D, Pi)
+        if cost < best_cost:
+            best, best_cost = Pi, cost
+        if (Pi == best).all():
+            break
+    return best
+
+
+def _sinkhorn(logPi: np.ndarray) -> np.ndarray:
+    """Sinkhorn scaling of a log-potential to a doubly stochastic matrix, in the log domain so a
+    small temperature does not underflow."""
+    n = logPi.shape[0]
+    u, v = np.zeros((n, 1)), np.zeros((1, n))
+    for _ in range(1000):
+        u = -_logsumexp(logPi + v, 1)
+        v = -_logsumexp(logPi + u, 0)
+        Pi = np.exp(logPi + u + v)
+        if abs(Pi.sum(1) - 1).max() < 1e-9 and abs(Pi.sum(0) - 1).max() < 1e-9:
+            break  # Sinkhorn has converged to a doubly stochastic coupling
     return Pi
 
 
 def _logsumexp(a: np.ndarray, axis: int) -> np.ndarray:
     m = a.max(axis=axis, keepdims=True)
     return m + np.log(np.exp(a - m).sum(axis=axis, keepdims=True))
+
+
+def gw_diagnostics(C: np.ndarray, D: np.ndarray, Pi: np.ndarray) -> dict:
+    """The three numbers that say whether a coupling found anything: its GW cost against the two
+    reference couplings (the true pairing, and no pairing at all), how much mass it puts on the
+    true pairs relative to uniform, and how often the true pair is the argmax of its row."""
+    n = len(C)
+    return {
+        "cost": gw_cost(C, D, Pi),
+        "cost_identity": gw_cost(C, D, np.eye(n)),
+        "cost_uniform": gw_cost(C, D, np.full((n, n), 1.0 / n)),
+        "true_pair_mass": float(Pi.diagonal().mean() * n),  # 1.0 is what a random pairing gives
+        "top1": float((Pi.argmax(1) == np.arange(n)).mean()),
+    }
 
 
 def gw_cost(C: np.ndarray, D: np.ndarray, Pi: np.ndarray) -> float:

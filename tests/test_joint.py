@@ -1,13 +1,14 @@
 """CKA is invariant to rotation and scale, Procrustes recovers a known rotation, CCA recovers a
 linear map, SIGReg is small for a Gaussian batch and large for a collapsed one, the cosine Gram
-has no diagonal, retrieval/MRR score a constructed case correctly, and the entropic GW coupling is
-doubly stochastic and recovers a known relabelling of the same geometry."""
+has no diagonal, retrieval/MRR score a constructed case correctly, and both GW couplings - entropic
+and hard assignment - recover a known relabeling of the same geometry, are equivariant under a
+joint relabeling, and report diagnostics against a pairing that is no pairing at all."""
 import numpy as np
 import torch
 
 from sna.joint import (cca, cka, cosine_distance, cosine_gram, fit_geometry, gw_coupling, gw_cost,
-                       mean_by_group, pair_correlation, pca, procrustes, retrieval, retrieval_scores,
-                       sigreg, transport, unit)
+                       gw_diagnostics, hard_gw_coupling, mean_by_group, pair_correlation, pca,
+                       procrustes, retrieval, retrieval_scores, sigreg, transport, unit)
 
 
 def test_gw_coupling_is_doubly_stochastic():
@@ -34,6 +35,56 @@ def test_gw_coupling_recovers_a_known_relabeling():
     inv = np.argsort(perm)  # point i of C is point inv[i] of D
     assert (np.argmax(Pi, 1) == inv).all()
     assert gw_cost(C, D, Pi) < gw_cost(C, D, np.eye(80))
+
+
+def _relabelled_geometries(n=120, dim=12, seed=6, noise=0.0):
+    """Two distance matrices of one geometry with its points relabelled (and optionally perturbed),
+    plus the inverse permutation that maps a point of C to its point in D."""
+    rng = np.random.default_rng(seed)
+    x = rng.normal(size=(n, dim))
+    perm = rng.permutation(n)
+    y = x[perm] + (rng.normal(size=(n, dim)) * noise if noise else 0)
+    return cosine_distance(x), cosine_distance(y), np.argsort(perm)
+
+
+def test_hard_gw_recovers_a_known_relabeling():
+    C, D, inv = _relabelled_geometries(120)
+    Pi = hard_gw_coupling(C, D, iters=20)
+    assert np.allclose(Pi.sum(1), 1.0) and np.allclose(Pi.sum(0), 1.0)  # a permutation
+    assert (Pi.argmax(1) == inv).all()
+    assert gw_cost(C, D, Pi) < 1e-6  # an isometry has zero GW cost
+    assert gw_cost(C, D, Pi) < gw_cost(C, D, np.eye(120))
+
+
+def test_annealing_reaches_a_no_colder_schedule_than_a_cold_start():
+    # The same temperature at the end of both runs; the one that started soft and cooled has had
+    # more room to search, so it cannot be worse than the one dropped straight into the hard regime.
+    C, D, _ = _relabelled_geometries(150, 20, seed=11, noise=0.5)
+    cold = gw_coupling(C, D, lam=0.01, iters=30)
+    annealed = gw_coupling(C, D, lam=0.01, iters=30, anneal_from=1.0)
+    assert gw_cost(C, D, annealed) <= gw_cost(C, D, cold)
+    assert np.allclose(gw_coupling(C, D, lam=0.01, iters=30, anneal_from=0.01), cold)  # flat schedule
+
+
+def test_couplings_are_equivariant_under_a_joint_relabeling():
+    # Relabelling the second geometry must relabel the coupling and change nothing else: a solver
+    # that depends on the order of the rows would report a different alignment for the same data.
+    C, D, _ = _relabelled_geometries(120)
+    q = np.random.default_rng(9).permutation(120)
+    D2 = D[np.ix_(q, q)]
+    for fit in (lambda a, b: gw_coupling(a, b, 0.01, 60), lambda a, b: hard_gw_coupling(a, b, 20)):
+        Pi, Pi2 = fit(C, D), fit(C, D2)
+        assert np.allclose(Pi2, Pi[:, q], atol=1e-6)
+        assert abs(gw_cost(C, D2, Pi2) - gw_cost(C, D, Pi)) < 1e-6
+
+
+def test_gw_diagnostics_are_relative_to_no_pairing_at_all():
+    rng = np.random.default_rng(12)
+    x = rng.normal(size=(120, 10))
+    C, D = cosine_distance(x), cosine_distance(x + rng.normal(size=(120, 10)) * 0.2)
+    d = gw_diagnostics(C, D, gw_coupling(C, D, lam=0.01, iters=60))
+    assert d["top1"] > 0.9 and d["true_pair_mass"] > 1.0  # 1.0 is what a random pairing gives
+    assert d["cost"] < d["cost_uniform"]
 
 
 def test_transport_with_an_identity_coupling_is_plain_cosine():

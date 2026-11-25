@@ -16,6 +16,7 @@ pair) say how much of any gain is real.
     python scripts/align_joint.py --encoder moljepa --dims 256 --seeds 3
     python scripts/align_joint.py --encoder molformer --methods cka,cca,procrustes
     python scripts/align_joint.py --encoder molformer --methods gw --gw-sub 2000 --gw-lam 0.1
+    python scripts/align_joint.py --encoder moljepa --methods gw --gw-method entropic,hard --gw-anneal 1.0
     python scripts/align_joint.py --encoder molformer --methods cka,cca,procrustes,infonce --synthetic
 """
 from __future__ import annotations
@@ -32,8 +33,9 @@ from rdkit import RDLogger
 from sna import paths
 from sna.align import canonical, fit_contrastive, fingerprints
 from sna.data import read_msg_tsv
-from sna.joint import (cca, cka, cosine_distance, fit_geometry, gw_coupling, gw_cost, mean_by_group,
-                       pair_correlation, pca, procrustes, retrieval, retrieval_scores, transport, unit)
+from sna.joint import (cca, cka, cosine_distance, fit_geometry, gw_coupling, gw_cost, gw_diagnostics,
+                       hard_gw_coupling, mean_by_group, pair_correlation, pca, procrustes, retrieval,
+                       retrieval_scores, transport, unit)
 from sna.towers import Tower
 
 RDLogger.DisableLog("rdApp.error")
@@ -95,8 +97,15 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=3)
     parser.add_argument("--methods", default="cka,cca,procrustes,infonce,geometry,gw")
     parser.add_argument("--gw-sub", type=int, default=2000, help="molecules in the GW pool (n^3 per iteration)")
-    parser.add_argument("--gw-lam", type=float, default=0.1, help="entropic temperature of the GW coupling")
+    parser.add_argument("--gw-lam", default="0.1", help="entropic temperature(s) of the GW coupling; "
+                                                         "a comma-separated list sweeps the temperature")
     parser.add_argument("--gw-iters", type=int, default=30)
+    parser.add_argument("--gw-method", default="entropic,hard",
+                        help="which GW couplings to fit: entropic (fixed lam), hard (Hungarian "
+                             "assignment, no temperature); --gw-anneal adds the annealed entropic run")
+    parser.add_argument("--gw-anneal", type=float, default=None,
+                        help="start the entropic coupling at this lam and anneal geometrically to "
+                             "--gw-lam; the annealed run is the one to compare against")
     parser.add_argument("--synthetic", action="store_true",
                         help="add rule-based in-silico spectra: fit the alignment on synthetic pairs and "
                              "test it on real held-out spectra")
@@ -201,14 +210,31 @@ def main() -> None:
             sub = np.random.default_rng(seed).choice(len(unique), args.gw_sub, replace=False)
             C, D = cosine_distance(z_unique[sub]), cosine_distance(m_train[sub])
             C, D = C / C.mean(), D / D.mean()
-            Pi = gw_coupling(C, D, lam=args.gw_lam, iters=args.gw_iters)
             n = len(sub)
-            print(f"[gw] seed {seed} pool {n}: cost {gw_cost(C, D, Pi):.1f}  "
-                  f"identity coupling {gw_cost(C, D, np.eye(n)):.1f}  "
-                  f"uniform coupling {gw_cost(C, D, np.full((n, n), 1.0 / n)):.1f}  "
-                  f"mass on the true pair {Pi.diagonal().mean() * n:.2f}x uniform")
-            record(f"gw transport lam{args.gw_lam}", transport(z_held, z_unique[sub], Pi), None,
-                   fp_train[sub], ids_train[sub], note=f"seed {seed}")
+            names = args.gw_method.split(",") + (["annealed"] if args.gw_anneal else [])
+            for lam in [float(x) for x in str(args.gw_lam).split(",")]:
+                fit = {"entropic": lambda: gw_coupling(C, D, lam, args.gw_iters),
+                       "annealed": lambda: gw_coupling(C, D, lam, args.gw_iters, anneal_from=args.gw_anneal),
+                       "hard": lambda: hard_gw_coupling(C, D, args.gw_iters)}
+                for name in names:
+                    Pi = fit[name]()
+                    d = gw_diagnostics(C, D, Pi)
+                    print(f"[gw {name:<8}] seed {seed} lam {lam:<5} pool {n}: cost {d['cost']:>10.1f}  "
+                          f"identity {d['cost_identity']:>10.1f}  uniform {d['cost_uniform']:>10.1f}  "
+                          f"true-pair mass {d['true_pair_mass']:.2f}x uniform  top1 {d['top1']:.3f}")
+                    record(f"gw {name} lam{lam}", transport(z_held, z_unique[sub], Pi), None,
+                           fp_train[sub], ids_train[sub], note=f"seed {seed}")
+            # Control: hide the true pairing behind a random permutation of the molecule geometry.
+            # If the coupling recovers that permutation, it is capable of finding a correspondence
+            # in these two geometries, and failing to find the real one is a property of the data
+            # rather than of the solver.
+            q = np.random.default_rng(seed + 97).permutation(n)
+            Dq = D[np.ix_(q, q)]
+            Pi = gw_coupling(C, Dq, lam=min(float(x) for x in str(args.gw_lam).split(",")),
+                             iters=args.gw_iters)
+            print(f"[gw control ] seed {seed} pool {n}: injected pairing recovered top1 "
+                  f"{(Pi.argmax(1) == q).mean():.3f}  cost {gw_cost(C, Dq, Pi):.1f} "
+                  f"vs identity {gw_cost(C, Dq, np.eye(n)):.1f}")
             record("raw cosine, same pool", z_held, z_unique[sub], fp_train[sub], ids_train[sub],
                    note="identity coupling baseline")
 
