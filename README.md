@@ -506,6 +506,95 @@ non-isometric space. If synthetic data is added later, it has to come from a phy
 fragmentation model (Fpocket, MolGen), be validated against real spectra, and be used only as
 augmentation alongside real pairs, never as the alignment target.
 
+## Putting the precursor mass into the joint space
+
+Mass is the one quantity both sides share exactly, so the obvious next step is to train the joint
+latent so that it *contains* it. Before training anything, `scripts/mass_probe.py` asks whether the
+frozen spaces already carry it: a ridge map from the 1024-d DreaMS spectrum embedding to the neutral
+exact mass of the molecule reaches R² 0.771 on the val fold but a median error of **39.6 Da** - only
+1.3% of molecules land within a dalton. The Mol-JEPA molecule side is worse (R² 0.584, 51.5 Da) and
+the embedding norm alone is worse than predicting the mean (R² -1.32). The mass is not in the
+embeddings; it is in the TSV, whose `parent_mass` agrees with RDKit's exact mass to 0.0001 Da. Mass
+is therefore free as a filter and expensive as a representation.
+
+`fit_geometry` (`sna/joint.py`) takes a fourth term accordingly: one *shared* readout on the joint
+latent - an MLP, because a single linear axis cannot pin a 130 Da spread to a dalton - must return
+the mass from the spectrum side *and* from the molecule side, so the two have to agree. With
+`--mass-target classes` the target is not one number but a coarse-to-fine ladder of molecular
+classes (`sna/align.py: descriptors`): element counts, heavy atoms, rings, degree of unsaturation,
+nominal mass, exact mass. The latent is then rewarded for getting a *class* right before it is
+rewarded for getting the molecule right, and retrieval is scored with `formula@5` - the fraction of
+the top-5 hits that share the query's molecular formula.
+
+```bash
+python scripts/align_joint.py --tsv data/MassSpecGym1.5.tsv --encoder moljepa \
+  --methods geometry --mass-gamma 0.1,1.0,10.0 --mass-target classes --seeds 1
+```
+
+Mol-JEPA, val fold, 25046 train molecules, 256-d projectors, seed 0. `formula@5` is the fraction of
+the top-5 hits that share the query's molecular formula; chance is 0.00003 and the ceiling is 0.186,
+because only 18.6% of held-out molecules have a congener in the train pool.
+
+| target of the readout | weight | retrieval top-1 | exact match against the fold's own molecules | formula@5 | Spearman rho with Tanimoto | median mass error, train / held |
+|---|---|---|---|---|---|---|
+| none (pairing + geometry + SIGReg) | - | 0.149 | 0.030 | 0.0006 | 0.268 | - |
+| exact mass, linear head, 20 epochs | 0.1 | 0.150 | 0.034 | - | 0.296 | - / 31.2 Da |
+| exact mass, linear head, 20 epochs | 1.0 | 0.149 | 0.028 | - | 0.321 | - / 24.2 Da |
+| exact mass, linear head, 20 epochs | 10.0 | 0.139 | 0.014 | - | 0.380 | - / 24.8 Da |
+| exact mass, MLP head, 60 epochs | 0 | 0.144 | 0.024 | - | 0.230 | - |
+| exact mass, MLP head, 60 epochs | 1.0 | 0.150 | 0.028 | - | 0.252 | 5.8 / 27.2 Da |
+| exact mass, MLP head, 60 epochs | 10.0 | 0.153 | 0.022 | - | 0.347 | 3.1 / 23.0 Da |
+| class ladder, 20 epochs | 1.0 | **0.159** | 0.034 | 0.0009 | 0.331 | 11.5 / 30.1 Da |
+| class ladder, 20 epochs | 10.0 | 0.157 | 0.021 | 0.0007 | **0.425** | 10.4 / 33.1 Da |
+| class ladder without the mass columns, 20 epochs | 1.0 | 0.157 | 0.032 | 0.0009 | 0.335 | - |
+| class ladder without the mass columns, 20 epochs | 10.0 | 0.157 | 0.022 | 0.0008 | 0.431 | - |
+| raw spectrum cosine | - | 0.184 | - | 0.0024 | 0.142 | - |
+| random | - | 0.097 | 0.010 | 0.00003 | 0.008 | - |
+
+Giving the head real capacity fixes the collapse: with the MLP the top-1 no longer falls apart at a
+weight of 10 (0.153 instead of 0.139), and the readout can drive the *training* masses to 3 Da. It
+cannot make them generalise: the same fit is still 23 Da off on molecules it has never seen, and only
+2.6% of held-out molecules land within a dalton. Memorising 25046 masses is easy; predicting a mass
+from a spectrum embedding is not, because the embedding does not contain the mass.
+
+The class ladder is the version that works. Predicting element counts, heavy atoms, rings,
+unsaturation, nominal mass and exact mass - instead of one number that has to be exact - lifts top-1
+from 0.149 to 0.159 and the rank correlation with structure from 0.268 to 0.425, the largest rho in
+the whole benchmark. Rewarding the latent for getting a *class* right is worth more than rewarding it
+for getting a dalton right.
+
+The ablation says where that gain comes from: delete the two mass columns from the ladder and top-1
+is 0.157 with rho 0.431 - the same as with them. It is the chemistry classes doing the work, not the
+mass.
+
+It does not, however, make the space group congeners: formula@5 stays at 0.0009, below the raw
+spectrum cosine (0.0024) and fifty times below simply ranking by the precursor mass (0.051).
+
+Mass as a score, with no training at all - `cos + 2w t_query t_candidate`, which for a fixed query is
+the same ranking as `cos - w (t_query - t_candidate)^2`, the hard filter with the cut replaced by a
+graded penalty:
+
+| how mass enters the score | top-1 | formula@5 |
+|---|---|---|
+| cosine + soft mass axis, w=0.1 | 0.186 | 0.0025 |
+| cosine + soft mass axis, w=1.0 | 0.167 | 0.0029 |
+| cosine + soft mass axis, w=10.0 | 0.125 | 0.0014 |
+| cosine, candidates within 1 Da | 0.141 | 0.0155 |
+| precursor mass only | 0.134 | 0.0505 |
+
+A whisper of mass (w=0.1) nudges top-1 from 0.184 to 0.186; a hard 1 Da cut drops it to 0.141 and a
+strong mass term to 0.125.
+
+The mass term makes the latent mass-aware without making it mass-exact: rho with Tanimoto climbs from
+0.268 to 0.380 as the weight rises, even though retrieval never catches the raw cosine.
+
+**Recommendation:** two jobs, two uses. For *analogue* retrieval - "which compound is it like" - mass
+belongs in the training target as a class ladder and not in the score: the ladder is the only fit that
+beats the plain pairing baseline, while a hard "candidates within 1 Da of the precursor" screen *lowers*
+top-1 from 0.184 to 0.141, because the structurally closest train molecules usually do not share the
+precursor. For *identification* - "which compound is this" - the raw precursor mass is still the best
+class filter we measured, and no learned latent comes close.
+
 ## License
 
 [MIT](LICENSE). Upstream acknowledgments and license notices are in

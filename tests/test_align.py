@@ -65,6 +65,15 @@ def test_smiles_tanimoto_matches_the_bit_matrices():
     assert abs(smiles_tanimoto("CCO", "CCOC") - tanimoto(fp[:1], fp[1:2])[0]) < 1e-9
 
 
+def test_descriptors_give_the_molecular_class_ladder():
+    from sna.align import descriptors
+    d = descriptors(["CC(=O)Oc1ccccc1C(=O)O", "xyz"])
+    assert list(d[0][:9]) == [9, 8, 0, 4, 0, 0, 0, 0, 0]  # C9H8O4, implicit hydrogens counted
+    assert d[0][9] == 13 and d[0][10] == 1 and d[0][11] == 6  # heavy atoms, rings, unsaturation
+    assert d[0][12] == 180 and abs(d[0][13] - 180.0423) < 1e-3
+    assert d[1].sum() == 0  # RDKit cannot parse it
+
+
 def test_tanimoto_matrix_is_the_full_pairwise_similarity():
     """Every entry of the matrix, not just the paired diagonal, against a per-row count."""
     rng = np.random.default_rng(3)

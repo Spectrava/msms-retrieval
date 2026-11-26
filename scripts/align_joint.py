@@ -31,11 +31,11 @@ import torch
 from rdkit import RDLogger
 
 from sna import paths
-from sna.align import canonical, fit_contrastive, fingerprints, tanimoto_matrix
+from sna.align import canonical, descriptors, exact_mass, fit_contrastive, fingerprints, formulas, tanimoto_matrix
 from sna.data import read_msg_tsv
 from sna.joint import (cca, cka, cosine_distance, fit_geometry, gw_coupling, gw_diagnostics,
                        hard_gw_coupling, mean_by_group, pair_correlation, pca, procrustes, retrieval,
-                       retrieval_scores, transport, unit)
+                       retrieval_scores, topk_match, transport, unit)
 from sna.towers import Tower
 
 RDLogger.DisableLog("rdApp.error")
@@ -93,6 +93,14 @@ def main() -> None:
     parser.add_argument("--dims", type=int, default=256)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--mass-gamma", default="",
+                        help="comma-separated weights for a shared mass readout on the joint latent "
+                             "(0 = no mass term); each weight is a separate geometry fit")
+    parser.add_argument("--mass-target", default="exact", choices=("exact", "classes", "classes-no-mass"),
+                        help="what that readout predicts: the monoisotopic mass, the HEAL-style "
+                             "ladder of molecular classes (element counts, heavy atoms, rings, "
+                             "unsaturation, nominal mass, exact mass), or that ladder without the "
+                             "two mass columns")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--seeds", type=int, default=3)
     parser.add_argument("--methods", default="cka,cca,procrustes,infonce,geometry,gw")
@@ -119,6 +127,7 @@ def main() -> None:
     args = parser.parse_args()
     methods = args.methods.split(",")
     lams = [float(x) for x in str(args.gw_lam).split(",")]
+    gammas = [float(x) for x in str(args.mass_gamma).split(",") if x]
     started = time.time()
 
     msg = read_msg_tsv(args.tsv)
@@ -145,6 +154,7 @@ def main() -> None:
     m_train, m_held = m[: len(unique)], m[len(unique):]
     fp = fingerprints(unique + list(held_ids))
     fp_train, fp_held = fp[: len(unique)], fp[len(unique):]
+    mass_train, mass_held = exact_mass(unique), exact_mass(list(held_ids))
 
     # one row per molecule: the mean spectrum of its train replicates, so a compound with many
     # spectra cannot dominate the batch and every replicate of a molecule is a positive
@@ -152,6 +162,7 @@ def main() -> None:
     z_train_n, m_train_n = unit(z_unique), unit(m_train)
 
     ids_train = np.array(unique)
+    formula = dict(zip(list(smiles), formulas(list(smiles))))
     rows = []
     def record(method, query, index, fp_index, ids_index, index_held=None, note=""):
         # Two pools: the held fold shares no molecule with the train fold, so retrieval against
@@ -162,23 +173,26 @@ def main() -> None:
         # score matrix (the precursor-mass shortcut), which has no embedding space whose collapse
         # or rank correlation could be reported.
         if index is None:
-            score = retrieval_scores(np.asarray(query, dtype=np.float32), fp_index, fp_held,
-                                     ids_index, held_ids)
+            matrix = np.asarray(query, dtype=np.float64)
             std = erank = spearman = None
             pool = len(fp_index)
         else:
             query = unit(np.asarray(query, dtype=np.float32))
             index = unit(np.asarray(index, dtype=np.float32))
-            score = retrieval(query, index, fp_index, fp_held, ids_index, held_ids)
+            matrix = query @ index.T.astype(np.float64)
             std, erank = collapse_report(query)
             spearman = pair_correlation(query, index, fp_index, fp_held)
             pool = len(index)
+        score = retrieval_scores(matrix, fp_index, fp_held, ids_index, held_ids)
+        class5 = topk_match(matrix, np.array([formula[s] for s in ids_index]),
+                           np.array([formula[s] for s in held_ids]))
         peer = retrieval(query, unit(np.asarray(index_held, dtype=np.float32)),
                          fp_held, fp_held, held_ids, held_ids) if index_held is not None else None
         row = dict(encoder=args.encoder, fold=args.fold, method=method,
                    dim=1 if index is None else query.shape[1],
                    pool=pool,
                    top1=score["top1"], top5=score["top5"], top10=score["top10"],
+                   formula_top5=class5,
                    top1_peer=peer["top1"] if peer else None,
                    exact_peer=peer["mrr"] if peer else None,
                    spearman=spearman, std=std, effective_rank=erank, note=note)
@@ -186,7 +200,7 @@ def main() -> None:
         peer_txt = "" if peer is None else f"  peer exact {row['exact_peer']:.3f}"
         collapse = "" if std is None else f"  rho {spearman:.3f}  std {std:.3f}  erank {erank:.1f}"
         print(f"{method:<24} pool {pool:>6}  top1 {row['top1']:.3f}  top5 {row['top5']:.3f}  "
-              f"top10 {row['top10']:.3f}{peer_txt}{collapse}")
+              f"top10 {row['top10']:.3f}  formula@5 {row['formula_top5']:.3f}{peer_txt}{collapse}")
 
     print(f"CKA(frozen spectrum space, frozen molecule space) = {cka(z_unique, m_train):.4f}")
 
@@ -207,10 +221,33 @@ def main() -> None:
     if "geometry" in methods:
         for alpha, beta in ((0.0, 0.0), (args.alpha, 0.0), (0.0, args.beta), (args.alpha, args.beta)):
             for seed in range(args.seeds):
-                spectrum, molecule = fit_geometry(z_unique, m_train, out=args.dims, alpha=alpha, beta=beta,
-                                                 epochs=args.epochs, seed=seed)
+                spectrum, molecule, _ = fit_geometry(z_unique, m_train, out=args.dims, alpha=alpha, beta=beta,
+                                                    epochs=args.epochs, seed=seed)
                 record(f"geometry a{alpha} b{beta}", spectrum(z_held), molecule(m_train), fp_train,
                        ids_train, molecule(m_held), f"seed {seed}")
+        target = descriptors(unique)
+        if args.mass_target == "classes-no-mass":
+            target = target[:, :-2]
+        elif args.mass_target == "exact":
+            target = mass_train
+        for gamma in gammas:
+            for seed in range(args.seeds):
+                spectrum, molecule, mass_of = fit_geometry(z_unique, m_train, out=args.dims,
+                                                          alpha=args.alpha, beta=args.beta,
+                                                          mass=target, gamma=gamma,
+                                                          epochs=args.epochs, seed=seed)
+                # predict_mass returns the finest level the readout was trained on, so a dalton
+                # error only means something when that level is the mass itself.
+                note = f"seed {seed}"
+                if args.mass_target != "classes-no-mass":
+                    err = np.abs(mass_of(z_held) - mass_held)
+                    fit = np.abs(mass_of(z_unique) - mass_train)
+                    note += (f"  mass err median {np.median(fit):.2f} Da on train / "
+                            f"{np.median(err):.2f} Da held, {(err <= 1).mean():.1%} held within 1 Da")
+                record(f"geometry {args.mass_target}{gamma}", spectrum(z_held), molecule(m_train), fp_train,
+                       ids_train, molecule(m_held),
+                       f"seed {seed}  mass err median {np.median(fit):.2f} Da on train / "
+                       f"{np.median(err):.2f} Da held, {(err <= 1).mean():.1%} held within 1 Da")
     if "gw" in methods:
         for seed in range(args.seeds):
             sub = np.random.default_rng(seed).choice(len(unique), args.gw_sub, replace=False)
@@ -327,6 +364,19 @@ def main() -> None:
     # embedding space here, hence no peer pool and no collapse report.
     record("precursor mass only", -np.abs(mass[None, :] - mz_held[:, None]), None,
            fp_train, ids_train, note="shortcut baseline")
+    # Mass as a filter rather than a coordinate: plain cosine, but only among candidates whose
+    # exact mass agrees with the precursor within 1 Da.
+    within = np.abs(mass[None, :] - mz_held[:, None]) <= 1.0
+    record("mass-filtered cosine", (z_held @ z_train_n.T) * within, None, fp_train, ids_train,
+           note="mass as a filter, not a learned coordinate")
+    # Mass as a soft coordinate of the embedding. For a fixed query, ranking by
+    # u.v + 2w t_q t_c is the same as ranking by u.v - w (t_q - t_c)^2, so this is the
+    # filter with the hard cut replaced by a graded penalty.
+    mu, sd = float(mass.mean()), float(mass.std())
+    t_train, t_held = (mass - mu) / sd, (mz_held - mu) / sd
+    for w in (0.1, 1.0, 10.0):
+        record(f"mass-axis cosine {w}", z_held @ z_train_n.T + 2 * w * t_held[:, None] * t_train[None, :],
+               None, fp_train, ids_train, note="mass as a graded coordinate of the spectrum embedding")
     rng = np.random.default_rng(0)
     record("random", rng.random((len(z_held), 8)), rng.random((len(unique), 8)), fp_train, ids_train,
            rng.random((len(held_ids), 8)), "floor")

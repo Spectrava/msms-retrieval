@@ -228,10 +228,18 @@ def sigreg(x: torch.Tensor, projections: int = 64, generator: torch.Generator | 
 
 
 def fit_geometry(z: np.ndarray, m: np.ndarray, out: int = 256, alpha: float = 1.0, beta: float = 0.1,
+                 mass: np.ndarray | None = None, gamma: float = 0.0,
                  epochs: int = 20, batch: int = 1024, seed: int = 0, lr: float = 1e-3, verbose: bool = True):
     """Two projectors into a shared space, trained with pairing + geometry + SIGReg.
 
-    Returns (predict_spectrum, predict_molecule), each giving a unit vector in the shared space.
+    `mass` (one monoisotopic Da value per pair) and `gamma` > 0 add a fourth term: one *shared*
+    readout must recover that mass from the latent on both sides, so the spectrum and its molecule
+    have to land at the same point along a mass axis. Masses are standardised so the term is O(1)
+    next to the others; without it the frozen spaces know mass only to ~40 Da (see
+    scripts/mass_probe.py).
+
+    Returns (predict_spectrum, predict_molecule, predict_mass); predict_mass reads the Da back off
+    a spectrum embedding.
     """
     torch.manual_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -239,32 +247,62 @@ def fit_geometry(z: np.ndarray, m: np.ndarray, out: int = 256, alpha: float = 1.
     gen.manual_seed(seed)
     head = lambda dim: nn.Sequential(nn.Linear(dim, out), nn.GELU(), nn.Linear(out, out)).to(device)
     spectrum, molecule = head(z.shape[1]), head(m.shape[1])
+    if mass is not None:
+        mass = np.asarray(mass, dtype=np.float32)
+        mass = mass[:, None] if mass.ndim == 1 else mass
+    # A single linear axis cannot pin a 130 Da spread to a dalton, so the readout is an MLP over
+    # the latent, and it can carry several class levels at once.
+    readout = nn.Sequential(nn.Linear(out, out), nn.GELU(),
+                            nn.Linear(out, 1 if mass is None else mass.shape[1])).to(device)
     zt, mt = torch.tensor(z, dtype=torch.float32).to(device), torch.tensor(m, dtype=torch.float32).to(device)
-    opt = torch.optim.AdamW(list(spectrum.parameters()) + list(molecule.parameters()), lr)
+    if mass is None:
+        mu = sd = np.ones(1)
+        target = None
+    else:
+        mu, sd = mass.mean(0), mass.std(0)
+        target = torch.tensor((mass - mu) / sd, device=device)
+    opt = torch.optim.AdamW(list(spectrum.parameters()) + list(molecule.parameters())
+                           + list(readout.parameters()), lr)
     for epoch in range(epochs):
         order = torch.randperm(len(zt), device=device)
-        loss = pair = geom = reg = 0.0
+        loss = pair = geom = reg = mloss = 0.0
         for i in range(0, len(zt), batch):
             r = order[i:i + batch]
             hs, hm = spectrum(zt[r]), molecule(mt[r])
-            l = (F.normalize(hs, dim=1) - F.normalize(hm, dim=1)).pow(2).sum(1).mean()
+            hn, mn = F.normalize(hs, dim=1), F.normalize(hm, dim=1)
+            l = (hn - mn).pow(2).sum(1).mean()
             g = (cosine_gram(hs) - cosine_gram(zt[r])).pow(2).mean() + \
                 (cosine_gram(hm) - cosine_gram(mt[r])).pow(2).mean()
             s = sigreg(hs, generator=gen) + sigreg(hm, generator=gen)
-            obj = l + alpha * g + beta * s
+            q = 0.0
+            if target is not None:
+                q = ((readout(hn).squeeze(1) - target[r]) ** 2).mean() + \
+                    ((readout(mn).squeeze(1) - target[r]) ** 2).mean()
+                mloss += q.item() * len(r)
+            obj = l + alpha * g + beta * s + gamma * q
             opt.zero_grad(); obj.backward(); opt.step()
-            loss += obj.item() * len(r); pair += l.item() * len(r); geom += g.item() * len(r); reg += s.item() * len(r)
+            loss += obj.item() * len(r); pair += l.item() * len(r); geom += g.item() * len(r)
+            reg += s.item() * len(r)
         n = len(zt)
         if verbose:
-            print(f"[geometry] epoch {epoch} loss {loss/n:.4f} pair {pair/n:.4f} geometry {geom/n:.4f} sigreg {reg/n:.4f}", flush=True)
-    spectrum.eval(); molecule.eval()
+            extra = "" if target is None else f" mass {mloss/n:.4f}"
+            print(f"[geometry] epoch {epoch} loss {loss/n:.4f} pair {pair/n:.4f} geometry {geom/n:.4f} "
+                  f"sigreg {reg/n:.4f}{extra}", flush=True)
+    spectrum.eval(); molecule.eval(); readout.eval()
 
     def predict(net):
         def f(x):
             with torch.no_grad():
                 return F.normalize(net(torch.tensor(x, dtype=torch.float32).to(device)), dim=1).cpu().numpy()
         return f
-    return predict(spectrum), predict(molecule)
+
+    def predict_mass(x):
+        """Monoisotopic mass in Da read off a spectrum embedding - the finest class level."""
+        with torch.no_grad():
+            h = F.normalize(spectrum(torch.tensor(x, dtype=torch.float32).to(device)), dim=1)
+            return (readout(h)[:, -1] * sd[-1] + mu[-1]).cpu().numpy()
+
+    return predict(spectrum), predict(molecule), predict_mass
 
 
 def retrieval_scores(score: np.ndarray, fp_index: np.ndarray, fp_query: np.ndarray,
@@ -282,6 +320,16 @@ def retrieval_scores(score: np.ndarray, fp_index: np.ndarray, fp_query: np.ndarr
         match = ids_index[order] == ids_query[i:i + chunk][:, None]
         mrr += float(((1.0 / (match.argmax(1) + 1)) * match.any(1)).sum())
     return {f"top{k}": top[k] / (min(k, len(fp_index)) * len(score)) for k in top} | {"mrr": mrr / len(score)}
+
+
+def topk_match(score: np.ndarray, labels_index: np.ndarray, labels_query: np.ndarray, k: int = 5) -> float:
+    """Fraction of the top-k hits that share the query's class label (a molecular formula, say).
+    The graded version of top-k: a hit in the right class counts even when the molecule is wrong."""
+    hits = 0.0
+    for i in range(0, len(score), 2000):
+        order = np.argsort(-score[i:i + 2000], axis=1)[:, :k]
+        hits += float((labels_index[order] == labels_query[i:i + 2000][:, None]).sum())
+    return hits / (min(k, len(labels_index)) * len(score))
 
 
 def retrieval(query: np.ndarray, index: np.ndarray, fp_index: np.ndarray, fp_query: np.ndarray,

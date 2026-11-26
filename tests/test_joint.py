@@ -197,9 +197,46 @@ def test_geometry_projectors_pair_the_data_without_collapsing():
     rng = np.random.default_rng(4)
     z = rng.normal(size=(400, 12))
     m = z @ np.linalg.qr(rng.normal(size=(12, 8)))[0]
-    spectrum, molecule = fit_geometry(z, m, out=16, alpha=1.0, beta=0.1, epochs=40, batch=100, seed=0, verbose=False)
+    spectrum, molecule, _ = fit_geometry(z, m, out=16, alpha=1.0, beta=0.1, epochs=40, batch=100,
+                                         seed=0, verbose=False)
     hs, hm = spectrum(z), molecule(m)
     assert np.isfinite(hs).all() and np.allclose(np.linalg.norm(hs, axis=1), 1.0, atol=1e-6)
     sim = hs @ hm.T
     assert sim.diagonal().mean() > sim.mean() + 0.2  # the pairing term: a pair is more alike than a random pair
     assert hs.std() > 0.01  # not collapsed onto one direction
+
+
+def test_mass_term_puts_the_precursor_in_the_shared_space():
+    """Mass is a linear function of the input here, so a fit trained with the mass term must read
+    the precursor better than the same fit trained without it."""
+    rng = np.random.default_rng(7)
+    z = rng.normal(size=(400, 12))
+    m = z @ np.linalg.qr(rng.normal(size=(12, 8)))[0]
+    mass = 200.0 + 300.0 * (z[:, 0] + 1.0)
+    _, _, without = fit_geometry(z, m, out=16, alpha=1.0, beta=0.1, epochs=60, batch=100,
+                                 seed=0, verbose=False)
+    spectrum, molecule, predict_mass = fit_geometry(z, m, out=16, alpha=1.0, beta=0.1,
+                                                   mass=mass, gamma=1.0, epochs=60, batch=100,
+                                                   seed=0, verbose=False)
+    assert np.median(np.abs(predict_mass(z) - mass)) < np.median(np.abs(without(z) - mass))
+    hs, hm = spectrum(z), molecule(m)
+    assert (hs @ hm.T).diagonal().mean() > (hs @ hm.T).mean()  # pairing survives the mass term
+
+
+def test_a_class_ladder_trains_as_a_multi_level_target():
+    """The readout can carry several class levels at once; the finest one is the exact mass."""
+    rng = np.random.default_rng(11)
+    z = rng.normal(size=(300, 12))
+    m = z @ np.linalg.qr(rng.normal(size=(12, 8)))[0]
+    classes = np.column_stack([z[:, 1], z[:, 2], 200.0 + 300.0 * (z[:, 0] + 1.0)])
+    _, _, predict_mass = fit_geometry(z, m, out=32, alpha=1.0, beta=0.1, mass=classes, gamma=1.0,
+                                      epochs=60, batch=100, seed=0, verbose=False)
+    assert np.median(np.abs(predict_mass(z) - classes[:, 2])) < 100.0
+
+
+def test_topk_match_counts_hits_in_the_right_class():
+    from sna.joint import topk_match
+    score = np.array([[0.9, 0.1, 0.5], [0.2, 0.8, 0.4]])
+    labels = np.array(["C9H8O4", "C6H6", "C2H6O"])
+    # query 0 takes {0, 2} (one of two matches), query 1 takes {1, 2} (one of two): 2 of 4 slots
+    assert abs(topk_match(score, labels, labels[:2], k=2) - 0.5) < 1e-9

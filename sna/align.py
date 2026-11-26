@@ -7,12 +7,13 @@ the cheapest possible test of whether the two spaces can be lined up at all.
 from __future__ import annotations
 
 import math
+from collections import Counter
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from rdkit import Chem
-from rdkit.Chem import DataStructs, rdFingerprintGenerator
+from rdkit.Chem import DataStructs, rdFingerprintGenerator, rdMolDescriptors
 from torch import nn
 
 MORGAN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
@@ -21,6 +22,52 @@ MORGAN = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
 def canonical(smiles: str) -> str | None:
     mol = Chem.MolFromSmiles(smiles)
     return Chem.MolToSmiles(mol) if mol else None
+
+
+def exact_mass(smiles: list[str]) -> np.ndarray:
+    """Monoisotopic mass in Da; 0.0 for a SMILES RDKit cannot parse."""
+    out = np.zeros(len(smiles), dtype=np.float64)
+    for i, s in enumerate(smiles):
+        mol = Chem.MolFromSmiles(s)
+        if mol:
+            out[i] = rdMolDescriptors.CalcExactMolWt(mol)
+    return out
+
+
+ELEMENTS = ("C", "H", "N", "O", "S", "Cl", "Br", "F", "P")
+CLASSES = list(ELEMENTS) + ["heavy atoms", "rings", "unsaturation", "nominal mass", "exact mass"]
+
+
+def descriptors(smiles: list[str]) -> np.ndarray:
+    """Coarse-to-fine molecular classes, one column per level of the hierarchy: element counts,
+    heavy atoms, rings, degree of unsaturation, nominal mass, exact mass. All-zero for a SMILES
+    RDKit cannot parse. This is the HEAL-style ladder - formula before mass before structure -
+    used as a training target so the latent is rewarded for getting a *class* right rather than
+    a molecule."""
+    out = np.zeros((len(smiles), len(CLASSES)), dtype=np.float64)
+    for i, s in enumerate(smiles):
+        mol = Chem.MolFromSmiles(s)
+        if not mol:
+            continue
+        counts = Counter(a.GetSymbol() for a in mol.GetAtoms())
+        counts["H"] = sum(a.GetTotalNumHs() for a in mol.GetAtoms())
+        out[i, : len(ELEMENTS)] = [counts[e] for e in ELEMENTS]
+        out[i, len(ELEMENTS)] = mol.GetNumHeavyAtoms()
+        out[i, len(ELEMENTS) + 1] = mol.GetRingInfo().NumRings()
+        halogens = sum(counts[e] for e in ("Cl", "Br", "I"))
+        out[i, len(ELEMENTS) + 2] = counts["C"] - (counts["H"] + halogens) / 2 + counts["N"] / 2 + 1
+        out[i, len(ELEMENTS) + 3] = round(rdMolDescriptors.CalcExactMolWt(mol))
+        out[i, len(ELEMENTS) + 4] = rdMolDescriptors.CalcExactMolWt(mol)
+    return out
+
+
+def formulas(smiles: list[str]) -> list[str]:
+    """Molecular formula per SMILES, '' when RDKit cannot parse it."""
+    out = []
+    for s in smiles:
+        mol = Chem.MolFromSmiles(s)
+        out.append(rdMolDescriptors.CalcMolFormula(mol) if mol else "")
+    return out
 
 
 def fingerprints(smiles: list[str]) -> np.ndarray:
