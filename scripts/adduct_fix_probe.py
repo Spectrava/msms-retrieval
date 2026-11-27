@@ -80,10 +80,10 @@ report("query and pool corrected", q, P_fixed)
 
 # How good is the map? Held-out check on held pairs.
 by_mol_h = {}
-for r, m, a in zip(held_rows, [unique.index(smiles[i]) for i in held_rows], add_held):
-    by_mol_h.setdefault(m, {})[a] = r
+for pos, a in enumerate(add_held):
+    by_mol_h.setdefault(held_smiles[pos], {})[a] = pos
 hp = [(v[1], v[2]) for v in by_mol_h.values() if 1 in v and 2 in v]
-pred = apply(z_held[[p[1] for p in hp]])
+pred = unit(apply(z_held[[p[1] for p in hp]]))
 true = unit(z_held[[p[0] for p in hp]])
 print(f"corrected vs true [M+H]+ cosine: {np.mean(np.sum(pred * true, axis=1)):.4f} "
       f"(uncorrected [M+Na]+ vs [M+H]+: {np.mean(np.sum(unit(z_held[[p[1] for p in hp]]) * true, axis=1)):.4f})")

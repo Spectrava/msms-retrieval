@@ -595,6 +595,62 @@ top-1 from 0.184 to 0.141, because the structurally closest train molecules usua
 precursor. For *identification* - "which compound is this" - the raw precursor mass is still the best
 class filter we measured, and no learned latent comes close.
 
+## How much headroom is there, and what actually closes it
+
+`scripts/ceiling_probe.py` measures the gap before any model is fitted. On the same 25046-molecule
+pool and the 19429 held val spectra, the *oracle* - rank the pool by true Tanimoto to the query -
+scores top-1 0.505 and top-5 0.441. Raw cosine puts that same molecule at median rank **1342** of
+25046, and only 4.2% of the time in the top 5. So the loss is not the ranking rule; it is that the
+embedding does not know which pool molecule is closest.
+
+The failures are not random. The molecule the oracle would pick reaches the cosine top 5 for 1.7% of
+spectra with fewer than 5 peaks and 8.8% of spectra with 80 or more; 3.0% at collision energy 0 eV
+against 17.6% at 6 eV; 4.9% for `[M+H]+` against 2.0% for `[M+Na]+` - even though the `[M+Na]+`
+queries have a *higher* oracle Tanimoto (0.611 against 0.471), so they are easier chemistry and the
+embedding is simply worse at them.
+
+Everything we tried on top of cosine, all training-free or closed-form, in `scripts/`:
+
+| attempt | top-1 | top-5 |
+|---|---|---|
+| raw cosine (the baseline) | 0.1838 | 0.1715 |
+| score ensemble, 0.8 DreaMS + 0.2 JEPA | 0.1886 | 0.1728 |
+| whitened (Mahalanobis) cosine | 0.1884 | 0.1734 |
+| centred cosine | 0.1839 | 0.1716 |
+| cosine on the top-400 PCA components | 0.1830 | 0.1709 |
+| max-pool the spectra of a molecule instead of averaging | 0.1867 | 0.1722 |
+| adduct-matched pool (compare like with like) | 0.1852 | 0.1719 |
+| linear `[M+Na]+` -> `[M+H]+` map fitted on 4576 train pairs | 0.1779 | 0.1682 |
+| raw peak-list cosine (fragment overlap) alone | 0.1484 | 0.1341 |
+| consensus reranking, `cos + lambda * mean Tanimoto to the top-K hits` | 0.1881 | 0.1797 |
+| class-ladder agreement term | 0.1825 | 0.1703 |
+| learned symmetric bilinear metric `Z B Z^T` | 0.1627 | 0.1590 |
+| ridge head: embedding -> soft 2048-bit fingerprint, rank by Tanimoto | 0.1890 | 0.1851 |
+| the same head with both encoders and acquisition metadata | 0.1914 | 0.1874 |
+| **blend 0.2 cosine + 0.8 fingerprint head** | **0.1988** | **0.1893** |
+
+The fingerprint head is the only thing that moves the needle, and it moves it by about one and a half
+Tanimoto points. It is a single closed-form ridge solve, `W = (Q^T Q + I)^-1 Q^T fp_train`, so it is
+cheap and it transfers. The blend sweep is flat between 0.4 and 0.8 head weight, which means the two
+signals are largely redundant rather than complementary - the head is not finding a different set of
+molecules, it is ordering the same ones slightly better.
+
+Two things that look promising and are not. Consensus reranking (a candidate scores higher if the
+other top hits look like it) *lowers* the best blend, because the top hits are already the answer.
+A learned metric fitted to the Tanimoto matrix reproduces it to 37% relative error and then retrieves
+*worse* than cosine, because the fit spends its capacity on the bulk of the matrix rather than on the
+top of each row.
+
+The formula question is a separate, harder one. The ceiling for formula@5 is 0.1857 - only 18.6% of
+held queries have a congener in the pool at all. Ranking by precursor mass alone reaches 0.0505;
+adding a predicted-formula bonus reaches 0.1766, but only when the bonus uses the *true* formula, so
+it is an oracle, not a method. The ridge head's mass prediction is off by 111 Da on average, which is
+not a formula error but a sign that a linear map from a 1024-d spectrum embedding cannot recover mass.
+
+**Recommendation:** stop tuning the score. The blend is within a point of everything else we tried,
+and the oracle is 30 points above it. The gap is in the encoder, not the ranking.
+
+
 ## License
 
 [MIT](LICENSE). Upstream acknowledgments and license notices are in
